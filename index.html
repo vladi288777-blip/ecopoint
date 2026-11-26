@@ -26,6 +26,20 @@
   .row:last-child { border-bottom:none; }
   .row b { text-align:right; }
   canvas { width:100%; height:170px; margin-top:6px; }
+  .phone { background:#0b0f12; border:1px solid var(--line); border-radius:14px; padding:10px; margin-top:8px; }
+  .sms { background:#22303a; border-radius:12px 12px 12px 3px; padding:8px 10px; margin:6px 0; font-size:13px; line-height:1.35; }
+  .sms .meta { color:var(--muted); font-size:11px; margin-bottom:3px; }
+  .btn { background:var(--card); color:var(--text); border:1px solid var(--accent); border-radius:6px; padding:5px 10px; cursor:pointer; margin-top:8px; }
+  .alert { position:fixed; inset:0; z-index:99999; display:flex; flex-direction:column; justify-content:center; align-items:center;
+           padding:24px; text-align:center; color:#fff; overflow:auto; }
+  .alert[hidden] { display:none; }
+  .alert .big { font-size:clamp(28px,6vw,64px); font-weight:800; letter-spacing:.04em; margin:6px 0; }
+  .alert .lv { font-size:clamp(16px,2.5vw,26px); opacity:.95; }
+  .alert ol { text-align:left; max-width:640px; font-size:clamp(16px,2.2vw,22px); line-height:1.4; margin:18px 0; padding-left:28px; }
+  .alert .go { font-size:clamp(18px,2.6vw,26px); font-weight:700; background:rgba(0,0,0,.28); border-radius:10px; padding:10px 16px; max-width:640px; }
+  .alert .ok { margin-top:18px; font-size:18px; padding:10px 28px; border-radius:10px; border:2px solid #fff; background:transparent; color:#fff; cursor:pointer; }
+  .alert.pulse { animation:apulse 1s infinite; }
+  @keyframes apulse { 50% { filter:brightness(1.25); } }
   .warn { font-size:12px; color:var(--muted); border-left:3px solid var(--l1); padding-left:8px; }
   @media (max-width: 800px) { main { grid-template-columns:1fr; grid-template-rows: 45vh auto; height:auto; } aside { border-left:none; } }
 </style>
@@ -260,15 +274,141 @@ function energyCard(sol, error) {
   </div>`;
 }
 
+// ---------- SMS-оповещение ----------
+// SMS работает на любом телефоне, без интернета и мессенджеров. Здесь — симулятор:
+// реальная отправка требует SMS-шлюза или интеграции с оповещением МЧС через операторов.
+const COMPASS = ["С", "СВ", "В", "ЮВ", "Ю", "ЮЗ", "З", "СЗ"];
+function bearingName(lat1, lon1, lat2, lon2) {
+  const dy = lat2 - lat1, dx = (lon2 - lon1) * Math.cos(lat1 * Math.PI / 180);
+  const deg = (Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360;
+  return COMPASS[Math.round(deg / 45) % 8];
+}
+// Куда уходить: ближайшая возвышенность из модуля рельефа или, если её нет, — заранее уехать.
+function whereToGo(lat, lon, terrain) {
+  if (terrain && terrain.safe) {
+    const km = terrain.safe.dist / 1000;
+    return `возвышенность ~${fmt(km, 1)} км на ${bearingName(lat, lon, terrain.safe.lat, terrain.safe.lon)}`;
+  }
+  return "к родным в посёлок выше по рельефу (рядом возвышенности нет)";
+}
+// Текст SMS по уровню. Коротко: на кнопочном телефоне кириллица — 70 знаков в одном SMS.
+function smsText(level, ctx) {
+  const when = ctx.inDays > 0 ? `через ${ctx.inDays} дн` : "сейчас";
+  switch (level) {
+    case 1: return `ECOPOINT: р.${ctx.river} растёт, подъём воды ${when}. Сложите документы и лекарства, зарядите телефон. Ждите SMS.`;
+    case 2: return `ECOPOINT: ОПАСНОСТЬ паводка ${when}. Соберите сумку, поднимите вещи повыше, договоритесь где жить. Куда идти: ${ctx.go}.`;
+    case 3: return `ECOPOINT: ВЫСОКАЯ ОПАСНОСТЬ. Уходите сейчас: ${ctx.go}. Возьмите документы и лекарства. Помощь: 112.`;
+    default: return ctx.falling
+      ? `ECOPOINT: вода спадает. Не возвращайтесь домой без разрешения МЧС. Электричество не включайте до проверки.`
+      : `ECOPOINT: угроза паводка снята.`;
+  }
+}
+const smsParts = t => (t.length <= 70 ? 1 : Math.ceil(t.length / 67));   // UCS-2: 70 знаков, в склейке по 67
+const smsBubble = (meta, text) =>
+  `<div class="sms"><div class="meta">${meta} · ${text.length} зн. · ${smsParts(text)} SMS</div>${text}</div>`;
+
+// Весна 2024 «день за днём»: SMS при росте уровня; один раз — когда вода пошла на спад; в конце — отбой.
+function scenario2024(river, ctx) {
+  const th = river.thresholds, s = river.spring2024, out = [];
+  let maxLv = 0, announcedFall = false, active = false;
+  for (let i = 0; i < s.length; i++) {
+    const lv = levelOf(s[i].q, th);
+    const falling = i > 0 && s[i].q < s[i - 1].q;
+    if (lv > maxLv) {                       // уровень вырос — новое предупреждение
+      maxLv = lv; active = true; announcedFall = false;
+      out.push({ t: s[i].t, lv, text: smsText(lv, { ...ctx, inDays: 0 }) });
+    } else if (active && falling && !announcedFall && lv >= 1) {   // пик пройден
+      announcedFall = true;
+      out.push({ t: s[i].t, lv, text: smsText(0, { ...ctx, falling: true }) });
+    } else if (active && lv === 0) {        // вернулись ниже порога — отбой
+      out.push({ t: s[i].t, lv: 0, text: smsText(0, { ...ctx, falling: false }) });
+      break;
+    }
+  }
+  return out;
+}
+
+// ---------- Полноэкранное предупреждение (как при землетрясении) ----------
+const ALERT_STEPS = {
+  1: ["Сложите документы, лекарства и деньги в один пакет.", "Зарядите телефон и пауэрбанк.", "Следите за обновлениями — следующее сообщение придёт при изменении уровня."],
+  2: ["Поднимите вещи и технику выше пола.", "Соберите сумку на 3 дня: документы, лекарства, вода, тёплая одежда.", "Договоритесь, где будете жить, и помогите соседям — пожилым и семьям с детьми.", "Будьте готовы выехать по первому сообщению."],
+  3: ["УХОДИТЕ СЕЙЧАС — не ждите воды во дворе.", "Отключите газ и электричество.", "Возьмите документы, лекарства, телефон.", "Скот выведите на возвышенность. Помощь: 112."],
+};
+function beep() {
+  try {
+    const a = new (window.AudioContext || window.webkitAudioContext)(), o = a.createOscillator(), g = a.createGain();
+    o.frequency.value = 880; g.gain.value = 0.15; o.connect(g); g.connect(a.destination);
+    o.start(); o.stop(a.currentTime + 0.4);
+  } catch (e) {}
+}
+function showAlert(level, ctx) {
+  const el = document.getElementById("alert");
+  if (level < 1) { el.hidden = true; return; }
+  const when = ctx.inDays > 0 ? `ожидается через ${ctx.inDays} дн.` : "ожидается сейчас";
+  el.style.background = ["", "#9a6700", "#c2410c", "#b91c1c"][level];
+  el.className = "alert" + (level >= 2 ? " pulse" : "");
+  el.innerHTML = `<div class="lv">ECOPOINT · ПРЕДУПРЕЖДЕНИЕ О ПАВОДКЕ</div>
+    <div class="big">${level === 3 ? "⚠ " : ""}${LEVELS[level].name.toUpperCase()}</div>
+    <div class="lv">р. ${ctx.river} · ${when}</div>
+    <div class="go">Куда идти: ${ctx.go}</div>
+    <ol>${ALERT_STEPS[level].map(x => `<li>${x}</li>`).join("")}</ol>
+    <div class="lv" style="max-width:640px">Это прогноз по модели, а не официальная команда эвакуации. Следуйте указаниям МЧС.</div>
+    <button class="ok" onclick="document.getElementById('alert').hidden=true">Понятно</button>`;
+  el.hidden = false;
+  if (level >= 2) { beep(); if (navigator.vibrate) navigator.vibrate([300, 150, 300]); }
+}
+
+function smsCard(lat, lon, river, live, terrain) {
+  if (!river || !river.thresholds) return "";
+  const ctx = { river: river.name.split(" · ")[0], go: whereToGo(lat, lon, terrain) };
+  // Живое SMS: первый день прогноза, когда расход дойдёт до уровня «Внимание» и выше.
+  let liveHtml = `<div class="muted">Сейчас SMS не отправляется: по прогнозу на 30 дней угрозы нет.</div>`;
+  if (live) {
+    const today = live.recent[live.recent.length - 1];
+    const series = [today, ...live.fc];
+    const hit = series.find(p => levelOf(p.q, river.thresholds) >= 1);
+    if (hit) {
+      const lv = Math.max(...series.map(p => levelOf(p.q, river.thresholds)));
+      const inDays = Math.max(0, Math.round((new Date(hit.t) - new Date(today.t)) / 864e5));
+      liveHtml = `<div class="phone">${smsBubble("сегодня", smsText(lv, { ...ctx, inDays }))}</div>`;
+    }
+  }
+  const sc = scenario2024(river, ctx);
+  const scHtml = sc.map(m => smsBubble(`${dm(m.t + "T")}.2024 · ${LEVELS[m.lv].name}`, m.text)).join("");
+  return `<div class="card"><h3>Оповещение по SMS</h3>
+    <div class="muted">SMS доходит на любой телефон — без интернета и мессенджеров. Текст привязан к этому дому: куда идти, считается по рельефу.</div>
+    ${liveHtml}
+    <button class="btn" onclick="document.getElementById('sc2024').hidden=!document.getElementById('sc2024').hidden">
+      Весна 2024: какие SMS получил бы житель (${sc.length})</button>
+    <div id="sc2024" class="phone" hidden>${scHtml || '<div class="muted">Порогов не было.</div>'}</div>
+    <div style="margin-top:8px"><span class="muted">Предупреждение на весь экран (демо):</span><br>
+      ${[1, 2, 3].map(l => `<button class="btn" onclick='showAlert(${l}, ${JSON.stringify({ ...ctx, inDays: l === 3 ? 0 : 4 - l })})'>${LEVELS[l].name}</button>`).join(" ")}</div>
+    <div class="muted" style="margin-top:6px">Прототип: здесь показано, что ушло бы на телефон. Реальная отправка — через SMS-шлюз или систему оповещения МЧС.</div>
+  </div>`;
+}
+
+// ---------- Что делать при каждом уровне ----------
+const ACTIONS = [
+  ["Норма", "Сохраните номер 112. Узнайте, где ближайшая возвышенность и пункт эвакуации."],
+  ["Внимание", "Документы, лекарства и деньги — в один пакет. Зарядите телефон и пауэрбанк. Проверьте лодку/сапоги, если живёте у реки."],
+  ["Опасность", "Поднимите вещи и технику повыше. Соберите сумку на 3 дня. Договоритесь, где жить. Помогите соседям — пожилым и с детьми."],
+  ["Высокая опасность", "Уходите заранее, не ждите воды во дворе. Отключите газ и электричество. Скот — на возвышенность. Следуйте указаниям МЧС."],
+];
+function actionsCard() {
+  return `<div class="card"><h3>Что делать при каждом уровне</h3>
+    ${ACTIONS.map(([n, a], i) => `<div class="row"><span style="color:${LEVELS[i].color};min-width:110px">${n}</span><span>${a}</span></div>`).join("")}
+  </div>`;
+}
+
 // ---------- Отходы ----------
 // Экопункты ТОО «Орал Таза Сервис», Уральск. Источник: informburo.kz (статья о ценах на вторсырьё в Уральске).
-// Координаты заполнить вручную из 2ГИС (клик по зданию → координаты). null = точка не показывается на карте.
+// Координаты взяты вручную из 2ГИС (26.11.2026). null = точка не показывается на карте.
 const WASTE_CITY = { lat: 51.2333, lon: 51.3667, radiusKm: 30 };
 const WASTE_ACCEPTS = "пластиковые бутылки, бумага, картон, книги, алюминиевые банки, полиэтилен, стрейч-плёнка, ПНД-канистры, отработанное подсолнечное масло";
 const WASTE_POINTS = [
-  { name: "Экопункт №1", address: "ул. Кердери, 133 (за ТД «Школьник»)", query: "Кердери 133",         lat: null, lon: null },
-  { name: "Экопункт №2", address: "ул. Монкеулы, 77 (Зачаганск)",         query: "Монкеулы 77",         lat: null, lon: null },
-  { name: "Экопункт №3", address: "мкр им. Кадыра Мырза Али, 5",          query: "Кадыра Мырза Али 5", lat: null, lon: null },
+  { name: "Экопункт №1", address: "ул. Кердери, 133 (за ТД «Школьник»)", query: "Кердери 133",         lat: 51.214839, lon: 51.376961 },
+  { name: "Экопункт №2", address: "ул. Монкеулы, 77 (Зачаганск)",         query: "Монкеулы 77",         lat: 51.178387, lon: 51.294318 },
+  { name: "Экопункт №3", address: "мкр им. Кадыра Мырза Али, 5",          query: "Кадыра Мырза Али 5", lat: 51.253421, lon: 51.427333 },
 ];
 // Поиск адреса в 2ГИС — работает без координат.
 const gisLink = q => `https://2gis.kz/uralsk/search/${encodeURIComponent(q)}`;
@@ -391,6 +531,81 @@ function checkCard(river) {
   </div>`;
 }
 
+
+// ---------- Водный резерв: что если часть паводка задержать ----------
+// Идеализированная модель управляемого хранилища (суточный шаг):
+// пока расход выше целевого — излишек уходит в хранилище; когда ниже — хранилище
+// понемногу отдаёт воду, не поднимая реку выше цели. V нужный = максимум заполнения.
+// НЕ учитывает время добегания, геометрию поймы, потери и сооружения.
+const DT = 86400, DEPTH_M = 0.5;
+function simulateReserve(series, target) {
+  let S = 0, Smax = 0, days = 0;
+  const out = series.map(p => {
+    let q = p.q;
+    if (q > target) { S += (q - target) * DT; days++; q = target; }
+    else if (S > 0) { const r = Math.min(S / DT, target - q); S -= r * DT; q += r; }
+    Smax = Math.max(Smax, S);
+    return { t: p.t, q };
+  });
+  return { out, mln: Smax / 1e6, km2: Smax / DEPTH_M / 1e6, days };
+}
+function drawTwo(canvas, before, after, target) {
+  const dpr = window.devicePixelRatio || 1, W = canvas.clientWidth, H = canvas.clientHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  const c = canvas.getContext("2d"); c.scale(dpr, dpr);
+  const maxQ = Math.max(...before.map(p => p.q)) * 1.1 || 1, pad = { l: 46, r: 8, t: 10, b: 18 };
+  const x = i => pad.l + (i / Math.max(before.length - 1, 1)) * (W - pad.l - pad.r);
+  const y = q => H - pad.b - (q / maxQ) * (H - pad.t - pad.b);
+  c.font = "11px system-ui"; c.fillStyle = "#8a9aa3";
+  [0, 0.5, 1].forEach(f => c.fillText(fmt(maxQ / 1.1 * f), 2, y(maxQ / 1.1 * f) + 4));
+  c.fillText(dm(before[0].t + "T"), pad.l, H - 4);
+  c.fillText(dm(before[before.length - 1].t + "T"), W - pad.r - 30, H - 4);
+  // зона, которую забрало хранилище
+  c.fillStyle = "rgba(88,166,255,.25)"; c.beginPath();
+  before.forEach((p, i) => i ? c.lineTo(x(i), y(p.q)) : c.moveTo(x(i), y(p.q)));
+  for (let i = after.length - 1; i >= 0; i--) c.lineTo(x(i), y(after[i].q));
+  c.fill();
+  c.setLineDash([4, 4]); c.strokeStyle = "#f0883e"; c.beginPath(); c.moveTo(pad.l, y(target)); c.lineTo(W - pad.r, y(target)); c.stroke(); c.setLineDash([]);
+  [[before, "#8a9aa3"], [after, "#58a6ff"]].forEach(([ser, col]) => {
+    c.strokeStyle = col; c.lineWidth = 2; c.beginPath();
+    ser.forEach((p, i) => i ? c.lineTo(x(i), y(p.q)) : c.moveTo(x(i), y(p.q))); c.stroke();
+  });
+}
+function reserveCard(river) {
+  if (!river.spring2024 || !river.peak2024 || !river.thresholds) return "";
+  const peak = river.peak2024.q, th = river.thresholds;
+  const rows = [
+    [`ниже «Высокой опасности» (${fmt(th.q10)} м³/с)`, th.q10],
+    [`ниже «Опасности» (${fmt(th.q5)} м³/с)`, th.q5],
+    ["пик −10%", peak * 0.9], ["пик −20%", peak * 0.8], ["пик −30%", peak * 0.7],
+  ].filter(([, q]) => q < peak).map(([n, q]) => {
+    const r = simulateReserve(river.spring2024, q);
+    return `<tr><td>${n}</td><td>${fmt(r.mln)}</td><td>${fmt(r.km2)}</td><td>${r.days}</td></tr>`;
+  }).join("");
+  return `<div class="card"><h3>Водный резерв: если задержать часть паводка</h3>
+    <div class="muted">Весна 2024. Сколько воды нужно временно задержать выше по реке, чтобы расход не поднялся выше цели, и сколько это полей под ${DEPTH_M} м воды.</div>
+    <canvas id="chartReserve"></canvas>
+    <div class="row"><span>Цель: не выше</span><b><input id="resT" type="range" min="50" max="99" value="80" style="vertical-align:middle"> <span id="resTv"></span></b></div>
+    <div id="resOut"></div>
+    <table style="width:100%;font-size:12px;margin-top:8px;border-collapse:collapse">
+      <tr class="muted"><td>Цель</td><td>млн м³</td><td>км² при ${DEPTH_M} м</td><td>дней</td></tr>${rows}</table>
+    <div class="muted" style="margin-top:6px">Идеальная модель: мгновенное управляемое хранилище без потерь. Не учитывает время добегания, рельеф поймы и сооружения; расход ≠ уровень у гидропоста. Это оценка масштаба, а не проект защиты.</div>
+  </div>`;
+}
+function bindReserve(river) {
+  const sl = document.getElementById("resT"); if (!sl) return;
+  const upd = () => {
+    const target = river.peak2024.q * sl.value / 100, r = simulateReserve(river.spring2024, target);
+    document.getElementById("resTv").textContent = `${sl.value}% пика · ${fmt(target)} м³/с`;
+    document.getElementById("resOut").innerHTML =
+      `<div class="row"><span>Нужно задержать</span><b>${fmt(r.mln)} млн м³</b></div>
+       <div class="row"><span>Площадь при глубине ${DEPTH_M} м</span><b>${fmt(r.km2)} км² (${fmt(r.km2 * 100)} га)</b></div>
+       <div class="row"><span>Дней набора воды</span><b>${r.days}</b></div>`;
+    drawTwo(document.getElementById("chartReserve"), river.spring2024, r.out, target);
+  };
+  sl.oninput = upd; upd();
+}
+
 function terrainCard(t) {
   return `<div class="card"><h3>Рельеф вокруг</h3>
     <div class="row"><span>Высота места</span><b>${fmt(t.h0)} м</b></div>
@@ -428,7 +643,8 @@ async function analyze(lat, lon) {
   let html = `<div class="card"><h3>Место</h3><div class="row"><span>Выбранная точка</span><b>${lat.toFixed(4)}, ${lon.toFixed(4)}</b></div>`;
   if (near) html += `<div class="row"><span>Ячейка реки в модели</span><b>~${fmt(near.dist, 1)} км</b></div>`;
   html += `</div>`;
-  if (near) html += waterCard(near.river, live, liveError) + checkCard(near.river);
+  if (near) html += waterCard(near.river, live, liveError)
+    + smsCard(lat, lon, near.river, live, terrain) + actionsCard() + checkCard(near.river) + reserveCard(near.river);
   else html += `<div class="card"><h3>Вода · паводки</h3><div class="muted">В MVP есть реки: ${RIVERS.map(r => r.name).join(", ")}.
     Эта точка дальше ${MAX_SNAP_KM} км от них.</div></div>`;
   html += airCard(air, airError);
@@ -447,6 +663,7 @@ async function analyze(lat, lon) {
   if (cSun && sol) drawChart(cSun, sol.hours, null, sol.hours.length, null, "кВт·ч");
   const c24 = document.getElementById("chart2024");
   if (c24) drawChart(c24, near.river.spring2024, near.river.thresholds, near.river.spring2024.length, near.river.known_peak?.date);
+  if (near) bindReserve(near.river);
 
   drawWasteMarkers();
   if (riverMarker) map.removeLayer(riverMarker);
@@ -457,5 +674,6 @@ async function analyze(lat, lon) {
     .addTo(map).bindTooltip("Ближайшая возвышенность");
 }
 </script>
+<div id="alert" class="alert" hidden></div>
 </body>
 </html>
