@@ -215,6 +215,86 @@ function airCard(s, error) {
   </div>`;
 }
 
+// ---------- Энергия ----------
+// Прогноз солнечной радиации на наклонную панель (Open-Meteo Forecast, global_tilted_irradiance).
+// Расчёт для условной системы 1 кВт: выработка, кВт·ч = GTI (Вт/м²) / 1000 × 1 кВт × КПД системы.
+const PV = { kWp: 1, tilt: 35, azimuth: 0, pr: 0.8 };   // юг, наклон 35°, потери 20% (инвертор, нагрев, грязь)
+async function fetchSolar(lat, lon) {
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat.toFixed(4)}&longitude=${lon.toFixed(4)}`
+            + `&hourly=global_tilted_irradiance&tilt=${PV.tilt}&azimuth=${PV.azimuth}&forecast_days=3&timezone=auto`;
+  const d = await getJSON(url);
+  const nowLocal = new Date(Date.now() + (d.utc_offset_seconds || 0) * 1000).toISOString().slice(0, 13);
+  const hours = d.hourly.time.map((t, i) => ({ t, q: (d.hourly.global_tilted_irradiance[i] || 0) / 1000 * PV.kWp * PV.pr }));
+  const days = {};
+  for (const h of hours) (days[h.t.slice(0, 10)] ??= []).push(h);
+  const start = Math.max(hours.findIndex(h => h.t.slice(0, 13) >= nowLocal), 0);
+  return { hours: hours.slice(start, start + 36), days, today: nowLocal.slice(0, 10) };
+}
+// Лучшее 3-часовое окно дня — когда включать стиралку, бойлер, зарядку.
+function bestSolarWindow(dayHours) {
+  let best = null;
+  for (let i = 0; i + 3 <= dayHours.length; i++) {
+    const sum = dayHours[i].q + dayHours[i + 1].q + dayHours[i + 2].q;
+    if (!best || sum > best.sum) best = { i, sum };
+  }
+  if (!best || best.sum < 0.05) return null;
+  return { label: `${dayHours[best.i].t.slice(11, 16)}–${dayHours[Math.min(best.i + 3, dayHours.length - 1)].t.slice(11, 16)}`, kwh: best.sum };
+}
+function energyCard(sol, error) {
+  if (error) return `<div class="card"><h3>Энергия · солнце</h3><div class="muted">${error}</div></div>`;
+  if (!sol) return "";
+  const dates = Object.keys(sol.days).filter(d => d >= sol.today).slice(0, 2);
+  let rows = "";
+  for (const d of dates) {
+    const total = sol.days[d].reduce((a, h) => a + h.q, 0);
+    const w = bestSolarWindow(sol.days[d]);
+    rows += `<div class="row"><span>${dm(d + "T")} — выработка 1 кВт панели</span><b>${fmt(total, 1)} кВт·ч</b></div>
+      <div class="row"><span>Лучшее время для стирки, бойлера, зарядки</span><b>${w ? `${w.label} (${fmt(w.kwh, 1)} кВт·ч)` : "солнца почти нет"}</b></div>`;
+  }
+  return `<div class="card"><h3>Энергия · солнце</h3>
+    <div class="muted">Если на крыше есть панели, переносите гибкую нагрузку на солнечные часы — меньше энергии из сети.</div>
+    <canvas id="chartSun"></canvas>
+    <div class="muted">Выработка 1 кВт панели по часам, кВт·ч (юг, наклон ${PV.tilt}°, потери ${Math.round((1 - PV.pr) * 100)}%).</div>
+    ${rows}
+    <div class="muted">Оценка по прогнозу погоды. Реальная выработка зависит от панелей, тени и снега на них.</div>
+  </div>`;
+}
+
+// ---------- Отходы ----------
+// Экопункты ТОО «Орал Таза Сервис», Уральск. Источник: informburo.kz (статья о ценах на вторсырьё в Уральске).
+// Координаты заполнить вручную из 2ГИС (клик по зданию → координаты). null = точка не показывается на карте.
+const WASTE_CITY = { lat: 51.2333, lon: 51.3667, radiusKm: 30 };
+const WASTE_ACCEPTS = "пластиковые бутылки, бумага, картон, книги, алюминиевые банки, полиэтилен, стрейч-плёнка, ПНД-канистры, отработанное подсолнечное масло";
+const WASTE_POINTS = [
+  { name: "Экопункт №1", address: "ул. Кердери, 133 (за ТД «Школьник»)", lat: null, lon: null },
+  { name: "Экопункт №2", address: "ул. Монкеулы, 77 (Зачаганск)",         lat: null, lon: null },
+  { name: "Экопункт №3", address: "мкр им. Кадыра Мырза Али, 5",          lat: null, lon: null },
+];
+const WASTE_SOURCE = "https://informburo.kz/stati/utilizaciia-musora-delo-blagorodnoe-po-kakim-cenam-v-uralske-sdaiut-plastik-bumagu-metall";
+let wasteMarkers = [];
+
+function wasteCard(lat, lon) {
+  if (distKm(lat, lon, WASTE_CITY.lat, WASTE_CITY.lon) > WASTE_CITY.radiusKm)
+    return `<div class="card"><h3>Отходы · куда сдать</h3><div class="muted">В MVP есть пункты приёма только по Уральску.</div></div>`;
+  const pts = WASTE_POINTS
+    .map(p => ({ ...p, d: p.lat != null ? distKm(lat, lon, p.lat, p.lon) : null }))
+    .sort((a, b) => (a.d ?? 1e9) - (b.d ?? 1e9));
+  const rows = pts.map(p => `<div class="row"><span>${p.name}<br><span class="muted">${p.address}</span></span>
+    <b>${p.d != null ? `~${fmt(p.d, 1)} км` : ""}</b></div>`).join("");
+  return `<div class="card"><h3>Отходы · куда сдать</h3>
+    <div class="muted">В Казахстане реальное вторсырьё получают примерно из 1,1% отходов: остальное можно вернуть в оборот, если сдать отдельно.</div>
+    ${rows}
+    <div class="muted" style="margin-top:6px">Принимают за деньги: ${WASTE_ACCEPTS}. Бутылки — чистыми и сплющенными.
+    Часы работы и цены уточняйте на месте. <a href="${WASTE_SOURCE}" target="_blank" style="color:var(--accent)">Источник</a>.</div>
+  </div>`;
+}
+function drawWasteMarkers() {
+  wasteMarkers.forEach(m => map.removeLayer(m));
+  wasteMarkers = WASTE_POINTS.filter(p => p.lat != null)
+    .map(p => L.circleMarker([p.lat, p.lon], { radius: 6, color: "#d29922" }).addTo(map)
+      .bindTooltip(`${p.name}: ${p.address}`));
+}
+
 // ---------- График ----------
 // series: [{t,q}]; split: с этого индекса — прогноз (голубым); markDate: вертикальная отметка.
 function drawChart(canvas, series, th, split = series.length, markDate = null, unit = "м³/с") {
@@ -223,12 +303,12 @@ function drawChart(canvas, series, th, split = series.length, markDate = null, u
   const W = canvas.clientWidth, H = canvas.clientHeight;
   canvas.width = W * dpr; canvas.height = H * dpr;
   const ctx = canvas.getContext("2d"); ctx.scale(dpr, dpr);
-  const maxQ = Math.max(th.q10, ...series.map(p => p.q)) * 1.1;
+  const maxQ = Math.max(th ? th.q10 : 0, ...series.map(p => p.q)) * 1.1 || 1;
   const pad = { l: 46, r: 8, t: 10, b: 18 };
   const x = i => pad.l + (i / Math.max(series.length - 1, 1)) * (W - pad.l - pad.r);
   const y = q => H - pad.b - (q / maxQ) * (H - pad.t - pad.b);
   ctx.font = "11px system-ui"; ctx.fillStyle = "#8a9aa3";
-  [[th.q2, "#d29922"], [th.q5, "#f0883e"], [th.q10, "#f85149"]].forEach(([q, c]) => {
+  (th ? [[th.q2, "#d29922"], [th.q5, "#f0883e"], [th.q10, "#f85149"]] : []).forEach(([q, c]) => {
     ctx.strokeStyle = c; ctx.setLineDash([4, 4]); ctx.beginPath();
     ctx.moveTo(pad.l, y(q)); ctx.lineTo(W - pad.r, y(q)); ctx.stroke();
   });
@@ -335,10 +415,13 @@ async function analyze(lat, lon) {
   const terrainP = fetchTerrain(lat, lon).catch(e => { terrainError = e.message; return null; });
   let airError = null;
   const airP = fetchAir(lat, lon).catch(e => { airError = e.message; return null; });
+  let solError = null;
+  const solP = fetchSolar(lat, lon).catch(e => { solError = e.message; return null; });
   let live = null, liveError = null;
   if (near) { try { live = await fetchRecent(near.river.cell); } catch (e) { liveError = e.message; } }
   const terrain = await terrainP;
   const air = await airP;
+  const sol = await solP;
 
   let html = `<div class="card"><h3>Место</h3><div class="row"><span>Выбранная точка</span><b>${lat.toFixed(4)}, ${lon.toFixed(4)}</b></div>`;
   if (near) html += `<div class="row"><span>Ячейка реки в модели</span><b>~${fmt(near.dist, 1)} км</b></div>`;
@@ -347,6 +430,8 @@ async function analyze(lat, lon) {
   else html += `<div class="card"><h3>Вода · паводки</h3><div class="muted">В MVP есть реки: ${RIVERS.map(r => r.name).join(", ")}.
     Эта точка дальше ${MAX_SNAP_KM} км от них.</div></div>`;
   html += airCard(air, airError);
+  html += energyCard(sol, solError);
+  html += wasteCard(lat, lon);
   html += terrain ? terrainCard(terrain) : `<div class="card"><h3>Рельеф</h3><div class="muted">Не удалось загрузить рельеф: ${terrainError || "нет ответа"}</div></div>`;
   html += DISCLAIMER + `<div class="muted">Пороги рассчитаны: ${DATA.generated || "—"}</div>`;
   panel.innerHTML = html;
@@ -356,9 +441,12 @@ async function analyze(lat, lon) {
   }
   const cAir = document.getElementById("chartAir");
   if (cAir && air) drawChart(cAir, air, AIR_TH, air.length, null, "мкг/м³");
+  const cSun = document.getElementById("chartSun");
+  if (cSun && sol) drawChart(cSun, sol.hours, null, sol.hours.length, null, "кВт·ч");
   const c24 = document.getElementById("chart2024");
   if (c24) drawChart(c24, near.river.spring2024, near.river.thresholds, near.river.spring2024.length, near.river.known_peak?.date);
 
+  drawWasteMarkers();
   if (riverMarker) map.removeLayer(riverMarker);
   if (near) riverMarker = L.circleMarker([near.river.cell.lat, near.river.cell.lon], { radius: 7, color: "#38bdf8" })
     .addTo(map).bindTooltip("Ячейка реки, по которой считается расход");
