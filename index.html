@@ -48,20 +48,11 @@
 <header><b>ECOPOINT</b><span>нажмите на карту или выберите точку:</span><div id="presets"></div></header>
 <main>
   <div id="map"></div>
-  <aside>
-    <div class="card" id="geo">
-      <button class="btn" id="geoBtn" style="margin-top:0">📍 Моё место</button>
-      <label class="muted" style="margin-left:8px"><input type="checkbox" id="watchBox"> Следить (раз в 30 мин)</label>
-      <div id="geoMsg" class="muted" style="margin-top:6px" hidden></div>
-      <div class="muted" style="margin-top:6px;font-size:11px">Координаты не сохраняются; передаются только в Open-Meteo для прогноза.
-        Уведомления работают, пока сайт открыт — фоновые push требуют сервера (следующий шаг).</div>
-    </div>
-    <div id="panel">
-      <div class="card">
-        <h3>Как пользоваться</h3>
-        <div class="muted">Выберите реку вверху или нажмите на место рядом с ней. Модуль «Вода» покажет
-        уровень паводковой угрозы, прогноз на 30 дней, проверку на паводке 2024 года и рельеф вокруг.</div>
-      </div>
+  <aside id="panel">
+    <div class="card">
+      <h3>Как пользоваться</h3>
+      <div class="muted">Выберите реку вверху или нажмите на место рядом с ней. Модуль «Вода» покажет
+      уровень паводковой угрозы, прогноз на 30 дней, проверку на паводке 2024 года и рельеф вокруг.</div>
     </div>
   </aside>
 </main>
@@ -367,27 +358,21 @@ function showAlert(level, ctx) {
   if (level >= 2) { beep(); if (navigator.vibrate) navigator.vibrate([300, 150, 300]); }
 }
 
-// Уровень угрозы по прогнозу: максимум за 30 дней и через сколько дней впервые «Внимание» и выше.
-function floodForecast(river, live) {
-  if (!river || !river.thresholds || !live || !live.recent.length) return null;
-  const today = live.recent[live.recent.length - 1];
-  const series = [today, ...live.fc];
-  const hit = series.find(p => levelOf(p.q, river.thresholds) >= 1);
-  if (!hit) return { level: 0, inDays: 0 };
-  return {
-    level: Math.max(...series.map(p => levelOf(p.q, river.thresholds))),
-    inDays: Math.max(0, Math.round((new Date(hit.t) - new Date(today.t)) / 864e5)),
-  };
-}
-
 function smsCard(lat, lon, river, live, terrain) {
   if (!river || !river.thresholds) return "";
   const ctx = { river: river.name.split(" · ")[0], go: whereToGo(lat, lon, terrain) };
   // Живое SMS: первый день прогноза, когда расход дойдёт до уровня «Внимание» и выше.
   let liveHtml = `<div class="muted">Сейчас SMS не отправляется: по прогнозу на 30 дней угрозы нет.</div>`;
-  const f = floodForecast(river, live);
-  if (f && f.level >= 1)
-    liveHtml = `<div class="phone">${smsBubble("сегодня", smsText(f.level, { ...ctx, inDays: f.inDays }))}</div>`;
+  if (live) {
+    const today = live.recent[live.recent.length - 1];
+    const series = [today, ...live.fc];
+    const hit = series.find(p => levelOf(p.q, river.thresholds) >= 1);
+    if (hit) {
+      const lv = Math.max(...series.map(p => levelOf(p.q, river.thresholds)));
+      const inDays = Math.max(0, Math.round((new Date(hit.t) - new Date(today.t)) / 864e5));
+      liveHtml = `<div class="phone">${smsBubble("сегодня", smsText(lv, { ...ctx, inDays }))}</div>`;
+    }
+  }
   const sc = scenario2024(river, ctx);
   const scHtml = sc.map(m => smsBubble(`${dm(m.t + "T")}.2024 · ${LEVELS[m.lv].name}`, m.text)).join("");
   return `<div class="card"><h3>Оповещение по SMS</h3>
@@ -546,6 +531,127 @@ function checkCard(river) {
   </div>`;
 }
 
+
+// ---------- Водный резерв: что если часть паводка задержать ----------
+// Идеализированная модель управляемого хранилища (суточный шаг):
+// пока расход выше целевого — излишек уходит в хранилище; когда ниже — хранилище
+// понемногу отдаёт воду, не поднимая реку выше цели. V нужный = максимум заполнения.
+// НЕ учитывает время добегания, геометрию поймы, потери и сооружения.
+const DT = 86400, DEPTH_M = 0.5;
+function simulateReserve(series, target) {
+  let S = 0, Smax = 0, days = 0;
+  const out = series.map(p => {
+    let q = p.q;
+    if (q > target) { S += (q - target) * DT; days++; q = target; }
+    else if (S > 0) { const r = Math.min(S / DT, target - q); S -= r * DT; q += r; }
+    Smax = Math.max(Smax, S);
+    return { t: p.t, q };
+  });
+  return { out, mln: Smax / 1e6, km2: Smax / DEPTH_M / 1e6, days };
+}
+function drawTwo(canvas, before, after, target) {
+  const dpr = window.devicePixelRatio || 1, W = canvas.clientWidth, H = canvas.clientHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  const c = canvas.getContext("2d"); c.scale(dpr, dpr);
+  const maxQ = Math.max(...before.map(p => p.q)) * 1.1 || 1, pad = { l: 46, r: 8, t: 10, b: 18 };
+  const x = i => pad.l + (i / Math.max(before.length - 1, 1)) * (W - pad.l - pad.r);
+  const y = q => H - pad.b - (q / maxQ) * (H - pad.t - pad.b);
+  c.font = "11px system-ui"; c.fillStyle = "#8a9aa3";
+  [0, 0.5, 1].forEach(f => c.fillText(fmt(maxQ / 1.1 * f), 2, y(maxQ / 1.1 * f) + 4));
+  c.fillText(dm(before[0].t + "T"), pad.l, H - 4);
+  c.fillText(dm(before[before.length - 1].t + "T"), W - pad.r - 30, H - 4);
+  // зона, которую забрало хранилище
+  c.fillStyle = "rgba(88,166,255,.25)"; c.beginPath();
+  before.forEach((p, i) => i ? c.lineTo(x(i), y(p.q)) : c.moveTo(x(i), y(p.q)));
+  for (let i = after.length - 1; i >= 0; i--) c.lineTo(x(i), y(after[i].q));
+  c.fill();
+  c.setLineDash([4, 4]); c.strokeStyle = "#f0883e"; c.beginPath(); c.moveTo(pad.l, y(target)); c.lineTo(W - pad.r, y(target)); c.stroke(); c.setLineDash([]);
+  [[before, "#8a9aa3"], [after, "#58a6ff"]].forEach(([ser, col]) => {
+    c.strokeStyle = col; c.lineWidth = 2; c.beginPath();
+    ser.forEach((p, i) => i ? c.lineTo(x(i), y(p.q)) : c.moveTo(x(i), y(p.q))); c.stroke();
+  });
+}
+function reserveCard(river) {
+  if (!river.spring2024 || !river.peak2024 || !river.thresholds) return "";
+  const peak = river.peak2024.q, th = river.thresholds;
+  const rows = [
+    [`ниже «Высокой опасности» (${fmt(th.q10)} м³/с)`, th.q10],
+    [`ниже «Опасности» (${fmt(th.q5)} м³/с)`, th.q5],
+    ["пик −10%", peak * 0.9], ["пик −20%", peak * 0.8], ["пик −30%", peak * 0.7],
+  ].filter(([, q]) => q < peak).map(([n, q]) => {
+    const r = simulateReserve(river.spring2024, q);
+    return `<tr><td>${n}</td><td>${fmt(r.mln)}</td><td>${fmt(r.km2)}</td><td>${r.days}</td></tr>`;
+  }).join("");
+  return `<div class="card"><h3>Водный резерв: если задержать часть паводка</h3>
+    <div class="muted">Весна 2024. Сколько воды нужно временно задержать выше по реке, чтобы расход не поднялся выше цели, и сколько это полей под ${DEPTH_M} м воды.</div>
+    <canvas id="chartReserve"></canvas>
+    <div class="row"><span>Цель: не выше</span><b><input id="resT" type="range" min="50" max="99" value="80" style="vertical-align:middle"> <span id="resTv"></span></b></div>
+    <div id="resOut"></div>
+    <table style="width:100%;font-size:12px;margin-top:8px;border-collapse:collapse">
+      <tr class="muted"><td>Цель</td><td>млн м³</td><td>км² при ${DEPTH_M} м</td><td>дней</td></tr>${rows}</table>
+    <div class="muted" style="margin-top:6px">Идеальная модель: мгновенное управляемое хранилище без потерь. Не учитывает время добегания, рельеф поймы и сооружения; расход ≠ уровень у гидропоста. Это оценка масштаба, а не проект защиты.</div>
+  </div>`;
+}
+function bindReserve(river) {
+  const sl = document.getElementById("resT"); if (!sl) return;
+  const upd = () => {
+    const target = river.peak2024.q * sl.value / 100, r = simulateReserve(river.spring2024, target);
+    document.getElementById("resTv").textContent = `${sl.value}% пика · ${fmt(target)} м³/с`;
+    document.getElementById("resOut").innerHTML =
+      `<div class="row"><span>Нужно задержать</span><b>${fmt(r.mln)} млн м³</b></div>
+       <div class="row"><span>Площадь при глубине ${DEPTH_M} м</span><b>${fmt(r.km2)} км² (${fmt(r.km2 * 100)} га)</b></div>
+       <div class="row"><span>Дней набора воды</span><b>${r.days}</b></div>`;
+    drawTwo(document.getElementById("chartReserve"), river.spring2024, r.out, target);
+    bankState.mln = r.mln; updBank();
+  };
+  sl.oninput = upd; upd();
+}
+
+
+// ---------- Водный банк: прогноз → контракт → выплата ----------
+// Параметрическая схема: выплата срабатывает автоматически, когда расход пересекает порог «Опасность».
+// Ставки и глубины — ДОПУЩЕНИЯ пользователя (ползунки), не рыночные цены и не измерения.
+const CHANNELS = [
+  { id: "field", name: "Поля под временное затопление", unit: "м слоя воды", def: 0.5, min: 0.1, max: 1, step: 0.1, k: 1 },
+  { id: "pond",  name: "Малые пруды и запруды в балках", unit: "м глубины", def: 2, min: 0.5, max: 5, step: 0.5, k: 1 },
+  { id: "snow",  name: "Снегозадержание (вода уходит в почву)", unit: "мм воды", def: 30, min: 5, max: 100, step: 5, k: 0.001 },
+];
+function bankCard(river) {
+  if (!river.spring2024 || !river.thresholds) return "";
+  const trig = river.spring2024.find(p => p.q >= river.thresholds.q5);
+  const lead = trig && river.known_peak ? Math.round((new Date(river.known_peak.date) - new Date(trig.t)) / 864e5) : null;
+  return `<div class="card"><h3>Водный банк: кто платит и за что</h3>
+    <div class="muted">Идея: город и страховщики платят фермерам выше по реке за то, что те принимают весеннюю воду. Выплата автоматическая — по порогу прогноза, без оценщиков и справок.</div>
+    <div class="row"><span>Триггер выплаты</span><b>расход ≥ «Опасность» (${fmt(river.thresholds.q5)} м³/с)</b></div>
+    <div class="row"><span>Весной 2024 сработал бы</span><b>${trig ? `${trig.t}${lead != null ? ` · за ${lead} дн. до пика на гидропосту` : ""}` : "не сработал"}</b></div>
+    <div class="row"><span>Объём заказа (из «Водного резерва»)</span><b id="bankV">—</b></div>
+    <div class="row"><span>Ставка, ₸ за 1000 м³ (допущение)</span><b><input id="bankRate" type="range" min="0" max="20000" step="500" value="5000" style="vertical-align:middle"> <span id="bankRateV"></span></b></div>
+    <h3 style="margin-top:10px">Сколько земли нужно, если задерживать одним способом</h3>
+    ${CHANNELS.map(c => `<div class="row"><span>${c.name}<br><span class="muted"><input id="ch_${c.id}" type="range" min="${c.min}" max="${c.max}" step="${c.step}" value="${c.def}"> <span id="chv_${c.id}"></span> ${c.unit}</span></span><b id="cha_${c.id}">—</b></div>`).join("")}
+    <div class="row"><span>Фонд выплат за сезон</span><b id="bankFund">—</b></div>
+    <div class="muted" style="margin-top:6px">Ставка, глубина прудов и слой снегозадержания — допущения для расчёта масштаба. Реальная схема требует гидравлической модели, согласования с бассейновой инспекцией и акиматом, проверки почв. Платёжной системы в прототипе нет.</div>
+  </div>`;
+}
+let bankState = { mln: 0 };
+function updBank() {
+  const rateEl = document.getElementById("bankRate"); if (!rateEl) return;
+  const m3 = bankState.mln * 1e6, rate = +rateEl.value;
+  document.getElementById("bankV").textContent = `${fmt(bankState.mln)} млн м³`;
+  document.getElementById("bankRateV").textContent = `${fmt(rate)} ₸`;
+  for (const c of CHANNELS) {
+    const v = +document.getElementById("ch_" + c.id).value;
+    document.getElementById("chv_" + c.id).textContent = fmt(v, 2);
+    const ha = m3 / (v * c.k) / 1e4;
+    document.getElementById("cha_" + c.id).textContent = `${fmt(ha)} га`;
+  }
+  const fund = m3 / 1000 * rate;
+  document.getElementById("bankFund").textContent = fund >= 1e9 ? `${fmt(fund / 1e9, 1)} млрд ₸` : `${fmt(fund / 1e6, 1)} млн ₸`;
+}
+function bindBank() {
+  ["bankRate", ...CHANNELS.map(c => "ch_" + c.id)].forEach(id => { const el = document.getElementById(id); if (el) el.oninput = updBank; });
+  updBank();
+}
+
 function terrainCard(t) {
   return `<div class="card"><h3>Рельеф вокруг</h3>
     <div class="row"><span>Высота места</span><b>${fmt(t.h0)} м</b></div>
@@ -584,7 +690,7 @@ async function analyze(lat, lon) {
   if (near) html += `<div class="row"><span>Ячейка реки в модели</span><b>~${fmt(near.dist, 1)} км</b></div>`;
   html += `</div>`;
   if (near) html += waterCard(near.river, live, liveError)
-    + smsCard(lat, lon, near.river, live, terrain) + actionsCard() + checkCard(near.river);
+    + smsCard(lat, lon, near.river, live, terrain) + actionsCard() + checkCard(near.river) + reserveCard(near.river) + bankCard(near.river);
   else html += `<div class="card"><h3>Вода · паводки</h3><div class="muted">В MVP есть реки: ${RIVERS.map(r => r.name).join(", ")}.
     Эта точка дальше ${MAX_SNAP_KM} км от них.</div></div>`;
   html += airCard(air, airError);
@@ -603,6 +709,7 @@ async function analyze(lat, lon) {
   if (cSun && sol) drawChart(cSun, sol.hours, null, sol.hours.length, null, "кВт·ч");
   const c24 = document.getElementById("chart2024");
   if (c24) drawChart(c24, near.river.spring2024, near.river.thresholds, near.river.spring2024.length, near.river.known_peak?.date);
+  if (near) { bindReserve(near.river); bindBank(); }
 
   drawWasteMarkers();
   if (riverMarker) map.removeLayer(riverMarker);
@@ -611,111 +718,7 @@ async function analyze(lat, lon) {
   if (safeMarker) map.removeLayer(safeMarker);
   if (terrain && terrain.safe) safeMarker = L.circleMarker([terrain.safe.lat, terrain.safe.lon], { radius: 8, color: "#3fb950" })
     .addTo(map).bindTooltip("Ближайшая возвышенность");
-
-  // Для геолокации и слежения: уровень по прогнозу и текст «куда идти».
-  const f = near ? floodForecast(near.river, live) : null;
-  if (!f) return null;
-  return { level: f.level, ctx: { river: near.river.name.split(" · ")[0], go: whereToGo(lat, lon, terrain), inDays: f.inDays } };
 }
-
-// ---------- Моё место, уведомления, слежение ----------
-// Без сервера: всё работает, только пока вкладка открыта. Координаты нигде не сохраняются.
-const WATCH_MS = 30 * 60 * 1000;
-const geoMsg = document.getElementById("geoMsg");
-const watchBox = document.getElementById("watchBox");
-let lastPos = null, lastLevel = null, lastCheck = 0, lastGo = null, watchId = null, watchTimer = null;
-
-function geoNote(text) { geoMsg.textContent = text; geoMsg.hidden = !text; }
-function geoErrorText(e) {
-  if (!e || e.code === undefined) return "Не удалось определить место.";
-  if (e.code === 1) return "Доступ к геолокации запрещён. Разрешите его в настройках сайта (значок слева от адреса) или нажмите на карту вручную.";
-  if (e.code === 2) return "Место не определено: нет сигнала GPS/сети. Попробуйте позже или нажмите на карту.";
-  if (e.code === 3) return "Геолокация не ответила вовремя. Попробуйте ещё раз или нажмите на карту.";
-  return "Ошибка геолокации: " + (e.message || e.code);
-}
-function geoAvailable() {
-  if (!("geolocation" in navigator)) { geoNote("Браузер не поддерживает геолокацию. Нажмите на карту вручную."); return false; }
-  if (!window.isSecureContext) { geoNote("Геолокация работает только по https или на localhost. Нажмите на карту вручную."); return false; }
-  return true;
-}
-function getPosition() {
-  return new Promise((ok, fail) => navigator.geolocation.getCurrentPosition(ok, fail,
-    { enableHighAccuracy: false, timeout: 15000, maximumAge: 10 * 60 * 1000 }));
-}
-// Разрешение на уведомления спрашиваем только по нажатию (жест пользователя).
-async function askNotify() {
-  if (!("Notification" in window) || Notification.permission !== "default") return;
-  try { await Notification.requestPermission(); } catch (e) {}
-}
-function notify(level, ctx) {
-  if (!("Notification" in window) || Notification.permission !== "granted") return;
-  const when = ctx.inDays > 0 ? `через ${ctx.inDays} дн.` : "сейчас";
-  try {
-    new Notification(`ECOPOINT: ${LEVELS[level].name}`, {
-      body: `р. ${ctx.river}: подъём воды ${when.replace(/\.$/, "")}. Куда идти: ${ctx.go}`, tag: "ecopoint-flood" });
-  } catch (e) {} // Android Chrome без service worker не даёт new Notification — остаётся экранная тревога
-}
-function warn(res) { showAlert(res.level, res.ctx); notify(res.level, res.ctx); }
-
-async function locateMe() {
-  await askNotify();
-  if (!geoAvailable()) return;
-  geoNote("Определяю место…");
-  let p;
-  try { p = await getPosition(); } catch (e) { geoNote(geoErrorText(e)); return; }
-  const { latitude: lat, longitude: lon } = p.coords;
-  lastPos = { lat, lon };
-  geoNote(`Точность ~${fmt(p.coords.accuracy)} м.`);
-  map.setView([lat, lon], 13);
-  const res = await analyze(lat, lon);
-  lastCheck = Date.now();
-  if (!res) { lastLevel = 0; return; }
-  lastLevel = res.level; lastGo = { lat, lon, go: res.ctx.go };
-  if (res.level >= 1) warn(res);
-}
-
-// Тик слежения: один лёгкий запрос расхода (по ячейке реки, не по координатам), панель не перерисовываем.
-async function watchTick() {
-  if (!lastPos || Date.now() - lastCheck < WATCH_MS - 60 * 1000) return; // не чаще раза в 30 мин
-  lastCheck = Date.now();
-  const near = nearestRiver(lastPos.lat, lastPos.lon);
-  let level = 0, ctx = null;
-  if (near) {
-    let live;
-    try { live = await fetchRecent(near.river.cell); } catch (e) { geoNote("Слежение: " + e.message); return; }
-    const f = floodForecast(near.river, live);
-    if (f) {
-      level = f.level;
-      const go = lastGo && distKm(lastPos.lat, lastPos.lon, lastGo.lat, lastGo.lon) < 1
-        ? lastGo.go : whereToGo(lastPos.lat, lastPos.lon, null);
-      ctx = { river: near.river.name.split(" · ")[0], go, inDays: f.inDays };
-    }
-  }
-  const prev = lastLevel ?? 0;
-  lastLevel = level;
-  geoNote(`Проверено в ${new Date().toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}: ${LEVELS[level].name}.`);
-  if (level > prev && level >= 1) warn({ level, ctx }); // только если уровень вырос
-}
-
-async function startWatch() {
-  await askNotify();
-  if (!geoAvailable()) { watchBox.checked = false; return; }
-  watchId = navigator.geolocation.watchPosition(
-    p => { lastPos = { lat: p.coords.latitude, lon: p.coords.longitude }; },
-    e => geoNote(geoErrorText(e)),
-    { enableHighAccuracy: false, maximumAge: 10 * 60 * 1000 });
-  watchTimer = setInterval(watchTick, WATCH_MS);
-  if (!lastPos) await locateMe(); // первая проверка сразу, дальше — по таймеру
-  if (!lastPos) { stopWatch(null); watchBox.checked = false; return; } // текст ошибки уже показан
-  geoNote("Слежение включено: проверка раз в 30 мин, пока вкладка открыта.");
-}
-function stopWatch(msg = "Слежение выключено.") {
-  if (watchId !== null) navigator.geolocation.clearWatch(watchId);
-  clearInterval(watchTimer); watchId = watchTimer = null;
-  if (msg) geoNote(msg);
-}
-document.getElementById("geoBtn").onclick = locateMe;
-watchBox.onchange = () => (watchBox.checked ? startWatch() : stopWatch());
 </script>
 <div id="alert" class="alert" hidden></div>
 </body>
