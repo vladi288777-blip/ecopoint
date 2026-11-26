@@ -593,40 +593,83 @@ function drawTwo(canvas, before, after, target) {
     ser.forEach((p, i) => i ? c.lineTo(x(i), y(p.q)) : c.moveTo(x(i), y(p.q))); c.stroke();
   });
 }
-function reserveCard(river) {
-  if (!river.spring2024 || !river.peak2024 || !river.thresholds) return "";
+// Затвор у хранилища ёмкостью V: открыт, пока СИГНАЛ ≥ цели; забирает избыток реки над целью, пока есть место.
+// Реальность отстаёт от модели на lag дней (весной 2024 у Уральска пик на посту был на 9 дней позже модели).
+// rule "forecast" — сигнал = ряд модели (прогноз); "fact" — сигнал = фактический расход у затвора.
+function shiftSeries(series, lag) {
+  return series.map((p, i) => ({ t: p.t, q: series[Math.max(0, i - lag)].q }));
+}
+function simulateGate(series, target, V, lag, rule) {
+  const truth = shiftSeries(series, lag);
+  let S = 0, maxTake = 0;
+  const out = truth.map((p, i) => {
+    const signal = rule === "forecast" ? series[i].q : p.q;
+    let take = 0;
+    if (signal >= target && S < V) take = Math.min(Math.max(p.q - target, 0), (V - S) / DT);
+    S += take * DT; maxTake = Math.max(maxTake, take);
+    return { t: p.t, q: p.q - take };
+  });
+  const peak = Math.max(...truth.map(p => p.q)), peakAfter = Math.max(...out.map(p => p.q));
+  return { truth, out, peak, peakAfter, maxTake, accepted: S / 1e6,
+    cut: peak > target ? (peak - peakAfter) / (peak - target) : 1 };
+}
+const DEPTHS = [0.3, 0.5, 1];
+function reserveRows(river, depth) {
   const peak = river.peak2024.q, th = river.thresholds;
-  const rows = [
+  return `<tr class="muted"><td>Цель</td><td>млн м³</td><td>км² при ${fmt(depth, 1)} м</td><td>дней</td></tr>` + [
     [`ниже «Высокой опасности» (${fmt(th.q10)} м³/с)`, th.q10],
     [`ниже «Опасности» (${fmt(th.q5)} м³/с)`, th.q5],
     ["пик −10%", peak * 0.9], ["пик −20%", peak * 0.8], ["пик −30%", peak * 0.7],
   ].filter(([, q]) => q < peak).map(([n, q]) => {
     const r = simulateReserve(river.spring2024, q);
-    return `<tr><td>${n}</td><td>${fmt(r.mln)}</td><td>${fmt(r.km2)}</td><td>${r.days}</td></tr>`;
+    return `<tr><td>${n}</td><td>${fmt(r.mln)}</td><td>${fmt(r.mln / depth)}</td><td>${r.days}</td></tr>`;
   }).join("");
+}
+function reserveCard(river) {
+  if (!river.spring2024 || !river.peak2024 || !river.thresholds) return "";
+  const sel = `style="background:var(--card);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:2px 4px"`;
   return `<div class="card"><h3>Водный резерв: если задержать часть паводка</h3>
-    <div class="muted">Весна 2024. Сколько воды нужно временно задержать выше по реке, чтобы расход не поднялся выше цели, и сколько это полей под ${DEPTH_M} м воды.</div>
+    <div class="muted">Весна 2024. Сколько воды нужно временно задержать выше по реке, чтобы расход не поднялся выше цели, и сколько это полей под водой. Серая линия — расход в реке, синяя — после хранилища.</div>
     <canvas id="chartReserve"></canvas>
     <div class="row"><span>Цель: не выше</span><b><input id="resT" type="range" min="50" max="99" value="80" style="vertical-align:middle"> <span id="resTv"></span></b></div>
+    <div class="row"><span>Ошибка прогноза по времени<br><span class="muted">реальный пик позже модели</span></span><b><input id="resLag" type="range" min="0" max="9" step="1" value="0" style="vertical-align:middle"> <span id="resLagV"></span></b></div>
+    <div class="row"><span>Открывать затвор</span><b><select id="resRule" ${sel}>
+      <option value="fact">по факту (расход у затвора)</option><option value="forecast">по прогнозу (модель)</option></select></b></div>
+    <div class="row"><span>Глубина воды на полях</span><b><select id="resDepth" ${sel}>
+      ${DEPTHS.map(d => `<option value="${d}"${d === DEPTH_M ? " selected" : ""}>${fmt(d, 1)} м</option>`).join("")}</select></b></div>
     <div id="resOut"></div>
-    <table style="width:100%;font-size:12px;margin-top:8px;border-collapse:collapse">
-      <tr class="muted"><td>Цель</td><td>млн м³</td><td>км² при ${DEPTH_M} м</td><td>дней</td></tr>${rows}</table>
-    <div class="muted" style="margin-top:6px">Идеальная модель: мгновенное управляемое хранилище без потерь. Не учитывает время добегания, рельеф поймы и сооружения; расход ≠ уровень у гидропоста. Это оценка масштаба, а не проект защиты.</div>
+    <table id="resTable" style="width:100%;font-size:12px;margin-top:8px;border-collapse:collapse"></table>
+    <div class="muted" style="margin-top:6px">Упрощённая модель: ёмкость = идеальный объём, без потерь и без трансформации волны по руслу. Ошибка по времени — сдвиг всего ряда, а не настоящий архивный прогноз. Расход ≠ уровень у гидропоста. Это оценка масштаба, а не проект защиты.</div>
   </div>`;
 }
 function bindReserve(river) {
   const sl = document.getElementById("resT"); if (!sl) return;
+  const lagEl = document.getElementById("resLag"), ruleEl = document.getElementById("resRule"), depthEl = document.getElementById("resDepth");
   const upd = () => {
     const target = river.peak2024.q * sl.value / 100, r = simulateReserve(river.spring2024, target);
+    const lag = +lagEl.value, rule = ruleEl.value, depth = +depthEl.value;
+    const g = simulateGate(river.spring2024, target, r.mln * 1e6, lag, rule);
+    const km2 = r.mln / depth, ok = g.cut >= 0.99;
     document.getElementById("resTv").textContent = `${sl.value}% пика · ${fmt(target)} м³/с`;
+    document.getElementById("resLagV").textContent = `${lag} дн.`;
     document.getElementById("resOut").innerHTML =
       `<div class="row"><span>Нужно задержать</span><b>${fmt(r.mln)} млн м³</b></div>
-       <div class="row"><span>Площадь при глубине ${DEPTH_M} м</span><b>${fmt(r.km2)} км² (${fmt(r.km2 * 100)} га)</b></div>
-       <div class="row"><span>Дней набора воды</span><b>${r.days}</b></div>`;
-    drawTwo(document.getElementById("chartReserve"), river.spring2024, r.out, target);
-    bankState.mln = r.mln; updBank();
+       <div class="row"><span>Площадь при глубине ${fmt(depth, 1)} м</span><b>${fmt(km2)} км² (${fmt(km2 * 100)} га)</b></div>
+       <div class="row"><span>Пиковый отбор из реки</span><b>${fmt(g.maxTake)} м³/с</b></div>
+       <div class="row"><span>Дней набора воды</span><b>${r.days}</b></div>
+       <div class="row"><span>Пик после мер</span><b style="color:${ok ? "var(--l0)" : "var(--l3)"}">${fmt(g.peakAfter)} из ${fmt(g.peak)} м³/с</b></div>
+       <div class="row"><span>Доля срезки до цели</span><b style="color:${ok ? "var(--l0)" : "var(--l3)"}">${fmt(g.cut * 100)}%</b></div>
+       ${!ok && rule === "forecast" ? `<div class="muted">Затвор закрылся по прогнозу раньше, чем пришёл настоящий пик. Прогноз — чтобы подготовить ёмкость, открывать — по факту.</div>` : ""}`;
+    document.getElementById("resTable").innerHTML = reserveRows(river, depth);
+    drawTwo(document.getElementById("chartReserve"), g.truth, g.out, target);
+    const fact = g.truth.find(p => p.q >= river.thresholds.q5);
+    const ready = river.spring2024.some(p => p.q >= river.thresholds.q5); // готовность — по ряду модели
+    Object.assign(bankState, { mln: r.mln, acc: g.accepted, factDate: fact ? fact.t : null, ready });
+    updBank();
   };
-  sl.oninput = upd; upd();
+  [sl, lagEl].forEach(el => el.oninput = upd);
+  [ruleEl, depthEl].forEach(el => el.onchange = upd);
+  upd();
 }
 
 
@@ -644,33 +687,46 @@ function bankCard(river) {
   const lead = trig && river.known_peak ? Math.round((new Date(river.known_peak.date) - new Date(trig.t)) / 864e5) : null;
   return `<div class="card"><h3>Водный банк: кто платит и за что</h3>
     <div class="muted">Идея: город и страховщики платят фермерам выше по реке за то, что те принимают весеннюю воду. Выплата автоматическая — по порогу прогноза, без оценщиков и справок.</div>
-    <div class="row"><span>Триггер выплаты</span><b>расход ≥ «Опасность» (${fmt(river.thresholds.q5)} м³/с)</b></div>
-    <div class="row"><span>Весной 2024 сработал бы</span><b>${trig ? `${trig.t}${lead != null ? ` · за ${lead} дн. до пика на гидропосту` : ""}` : "не сработал"}</b></div>
-    <div class="row"><span>Объём заказа (из «Водного резерва»)</span><b id="bankV">—</b></div>
-    <div class="row"><span>Ставка, ₸ за 1000 м³ (допущение)</span><b><input id="bankRate" type="range" min="0" max="20000" step="500" value="5000" style="vertical-align:middle"> <span id="bankRateV"></span></b></div>
+    <div class="row"><span>Порог</span><b>расход ≥ «Опасность» (${fmt(river.thresholds.q5)} м³/с)</b></div>
+    <div class="row"><span>Ёмкость по договору (из «Водного резерва»)</span><b id="bankV">—</b></div>
+    <h3 style="margin-top:10px">1. Плата за готовность — по прогнозу</h3>
+    <div class="row"><span>Весной 2024 объявлена бы<br><span class="muted">первый день модели ≥ порога</span></span><b>${trig ? `${trig.t}${lead != null ? ` · за ${lead} дн. до пика на гидропосту` : ""}` : "не объявлена"}</b></div>
+    <div class="row"><span>Ставка, ₸ за 1000 м³ ёмкости (допущение)</span><b><input id="bankReady" type="range" min="0" max="5000" step="250" value="1000" style="vertical-align:middle"> <span id="bankReadyV"></span></b></div>
+    <div class="row"><span>Сумма за готовность</span><b id="bankReadySum">—</b></div>
+    <h3 style="margin-top:10px">2. Плата за принятую воду — по факту</h3>
+    <div class="row"><span>Факт ≥ порога<br><span class="muted">с учётом ошибки прогноза из «Водного резерва»</span></span><b id="bankFactDate">—</b></div>
+    <div class="row"><span>Принято воды<br><span class="muted">по замеру; в прототипе — из симуляции затвора</span></span><b id="bankAcc">—</b></div>
+    <div class="row"><span>Ставка, ₸ за 1000 м³ принятой воды (допущение)</span><b><input id="bankRate" type="range" min="0" max="20000" step="500" value="5000" style="vertical-align:middle"> <span id="bankRateV"></span></b></div>
+    <div class="row"><span>Сумма за принятую воду</span><b id="bankAccSum">—</b></div>
     <h3 style="margin-top:10px">Сколько земли нужно, если задерживать одним способом</h3>
     ${CHANNELS.map(c => `<div class="row"><span>${c.name}<br><span class="muted"><input id="ch_${c.id}" type="range" min="${c.min}" max="${c.max}" step="${c.step}" value="${c.def}"> <span id="chv_${c.id}"></span> ${c.unit}</span></span><b id="cha_${c.id}">—</b></div>`).join("")}
-    <div class="row"><span>Фонд выплат за сезон</span><b id="bankFund">—</b></div>
-    <div class="muted" style="margin-top:6px">Ставка, глубина прудов и слой снегозадержания — допущения для расчёта масштаба. Реальная схема требует гидравлической модели, согласования с бассейновой инспекцией и акиматом, проверки почв. Платёжной системы в прототипе нет.</div>
+    <div class="row"><span>Фонд выплат за сезон (готовность + вода)</span><b id="bankFund">—</b></div>
+    <div class="muted" style="margin-top:6px">Обе ставки — допущения, не рыночные цены. Готовность платится по прогнозу, даже если вода пришла позже или не пришла; принятая вода — только по факту. Ставки, глубина прудов и слой снегозадержания — допущения для расчёта масштаба. Реальная схема требует гидравлической модели, согласования с бассейновой инспекцией и акиматом, проверки почв. Платёжной системы в прототипе нет.</div>
   </div>`;
 }
-let bankState = { mln: 0 };
+let bankState = { mln: 0, acc: 0, factDate: null, ready: false };
+const money = x => x >= 1e9 ? `${fmt(x / 1e9, 1)} млрд ₸` : `${fmt(x / 1e6, 1)} млн ₸`;
 function updBank() {
   const rateEl = document.getElementById("bankRate"); if (!rateEl) return;
-  const m3 = bankState.mln * 1e6, rate = +rateEl.value;
+  const m3 = bankState.mln * 1e6, rate = +rateEl.value, readyRate = +document.getElementById("bankReady").value;
+  const readySum = bankState.ready ? m3 / 1000 * readyRate : 0, accSum = bankState.acc * 1e6 / 1000 * rate;
   document.getElementById("bankV").textContent = `${fmt(bankState.mln)} млн м³`;
   document.getElementById("bankRateV").textContent = `${fmt(rate)} ₸`;
+  document.getElementById("bankReadyV").textContent = `${fmt(readyRate)} ₸`;
+  document.getElementById("bankReadySum").textContent = money(readySum);
+  document.getElementById("bankFactDate").textContent = bankState.factDate || "не было";
+  document.getElementById("bankAcc").textContent = `${fmt(bankState.acc)} из ${fmt(bankState.mln)} млн м³`;
+  document.getElementById("bankAccSum").textContent = money(accSum);
   for (const c of CHANNELS) {
     const v = +document.getElementById("ch_" + c.id).value;
     document.getElementById("chv_" + c.id).textContent = fmt(v, 2);
     const ha = m3 / (v * c.k) / 1e4;
     document.getElementById("cha_" + c.id).textContent = `${fmt(ha)} га`;
   }
-  const fund = m3 / 1000 * rate;
-  document.getElementById("bankFund").textContent = fund >= 1e9 ? `${fmt(fund / 1e9, 1)} млрд ₸` : `${fmt(fund / 1e6, 1)} млн ₸`;
+  document.getElementById("bankFund").textContent = money(readySum + accSum);
 }
 function bindBank() {
-  ["bankRate", ...CHANNELS.map(c => "ch_" + c.id)].forEach(id => { const el = document.getElementById(id); if (el) el.oninput = updBank; });
+  ["bankRate", "bankReady", ...CHANNELS.map(c => "ch_" + c.id)].forEach(id => { const el = document.getElementById(id); if (el) el.oninput = updBank; });
   updBank();
 }
 
