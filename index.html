@@ -4,20 +4,37 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ECOPOINT — экологический паспорт места</title>
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <style>
   :root { --bg:#0f1417; --card:#182026; --text:#e6edf0; --muted:#8a9aa3; --line:#2a353d;
           --l0:#3fb950; --l1:#d29922; --l2:#f0883e; --l3:#f85149; --accent:#38bdf8; }
   * { box-sizing:border-box; }
-  body { margin:0; font-family:system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
-  header { padding:12px 20px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
+  body { margin:0; font-family:system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--text);
+         display:flex; flex-direction:column; height:100vh; }
+  header { padding:10px 20px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap; gap:6px 14px; align-items:center; }
   header b { font-size:20px; letter-spacing:1px; }
-  header span { color:var(--muted); font-size:14px; }
-  #presets button { background:var(--card); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:4px 10px; margin-right:6px; cursor:pointer; }
-  #presets button:hover { border-color:var(--accent); }
-  main { display:grid; grid-template-columns: 1fr 440px; height:calc(100vh - 56px); }
+  header .tagline { color:var(--muted); font-size:14px; flex:1 1 320px; }
+  .hbtns { display:flex; gap:6px; }
+  .hbtn { background:var(--card); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:5px 10px; cursor:pointer; font-size:14px; white-space:nowrap; }
+  .hbtn:hover { border-color:var(--accent); }
+  main { display:grid; grid-template-columns: minmax(0, 1fr) 480px; flex:1; min-height:0; }
   #map { height:100%; }
-  aside { overflow-y:auto; padding:16px; border-left:1px solid var(--line); }
+  aside { overflow-y:auto; padding:12px 16px 16px; border-left:1px solid var(--line); min-width:0; }
+  .geobar { font-size:12px; margin-bottom:10px; }
+  .geobar .note { font-size:11px; margin-top:4px; }
+  .demo-badge { display:inline-block; font-size:12px; background:#13303f; color:var(--accent); border-radius:999px; padding:2px 10px; margin-bottom:8px; }
+  .place { font-size:12px; color:var(--muted); margin-bottom:8px; }
+  .tiles { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:8px; margin-bottom:10px; }
+  .tile { background:var(--card); border-radius:10px; padding:10px; border-top:3px solid var(--line); min-width:0; }
+  .tile .k { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+  .tile .v { font-size:20px; font-weight:700; margin:4px 0 2px; line-height:1.15; overflow-wrap:anywhere; }
+  .tile .s { font-size:11px; color:var(--muted); line-height:1.3; }
+  .tabs { display:flex; flex-wrap:wrap; gap:2px; border-bottom:1px solid var(--line); margin-bottom:10px; scrollbar-width:thin; }
+  .tabs button { flex:0 0 auto; background:none; border:none; border-bottom:2px solid transparent; color:var(--muted);
+                 padding:8px 10px; font-size:14px; cursor:pointer; white-space:nowrap; }
+  .tabs button[aria-selected="true"] { color:var(--text); border-bottom-color:var(--accent); }
+  .tabpane[hidden] { display:none; }
   .card { background:var(--card); border-radius:10px; padding:14px; margin-bottom:12px; }
   .card h3 { margin:0 0 8px; font-size:15px; }
   .muted { color:var(--muted); font-size:13px; }
@@ -41,27 +58,36 @@
   .alert.pulse { animation:apulse 1s infinite; }
   @keyframes apulse { 50% { filter:brightness(1.25); } }
   .warn { font-size:12px; color:var(--muted); border-left:3px solid var(--l1); padding-left:8px; }
-  @media (max-width: 800px) { main { grid-template-columns:1fr; grid-template-rows: 45vh auto; height:auto; } aside { border-left:none; } }
+  @media (max-width: 767px) {
+    body { height:auto; }
+    header { padding:8px 12px; gap:4px 10px; }
+    header b { font-size:17px; }
+    header .tagline { font-size:12px; flex-basis:100%; order:3; }
+    .hbtn { padding:4px 8px; font-size:13px; }
+    main { grid-template-columns:minmax(0, 1fr); grid-template-rows: 40vh auto; flex:none; }
+    .tabs { flex-wrap:nowrap; overflow-x:auto; }
+    aside { border-left:none; overflow:visible; padding:10px 12px 16px; }
+    .tile { padding:8px; } .tile .v { font-size:16px; }
+  }
 </style>
 </head>
 <body>
-<header><b>ECOPOINT</b><span>нажмите на карту или выберите точку:</span><div id="presets"></div></header>
+<header><b>ECOPOINT</b>
+  <div class="hbtns"><span id="presets" class="hbtns"></span><button class="hbtn" id="geoBtn">📍 Моё место</button></div>
+  <span class="tagline">Экологический паспорт места: предупреждаем о паводке заранее и считаем, как срезать пик</span>
+</header>
 <main>
   <div id="map"></div>
   <aside>
-    <div class="card" id="geo">
-      <button class="btn" id="geoBtn" style="margin-top:0">📍 Моё место</button>
-      <label class="muted" style="margin-left:8px"><input type="checkbox" id="watchBox"> Следить (раз в 30 мин)</label>
-      <div id="geoMsg" class="muted" style="margin-top:6px" hidden></div>
-      <div class="muted" style="margin-top:6px;font-size:11px">Координаты не сохраняются; передаются только в Open-Meteo для прогноза.
+    <div class="geobar" id="geo">
+      <label class="muted"><input type="checkbox" id="watchBox"> Следить за моим местом (раз в 30 мин)</label>
+      <div id="geoMsg" class="muted" style="margin-top:4px" hidden></div>
+      <div class="muted note">Координаты не сохраняются; передаются только в Open-Meteo для прогноза.
         Уведомления работают, пока сайт открыт — фоновые push требуют сервера (следующий шаг).</div>
     </div>
     <div id="panel">
-      <div class="card">
-        <h3>Как пользоваться</h3>
-        <div class="muted">Выберите реку вверху или нажмите на место рядом с ней. Модуль «Вода» покажет
-        уровень паводковой угрозы, прогноз на 30 дней, проверку на паводке 2024 года и рельеф вокруг.</div>
-      </div>
+      <div class="card"><h3>Загружаю демонстрационную точку…</h3>
+        <div class="muted">Или нажмите на карту рядом с рекой, или «📍 Моё место».</div></div>
     </div>
   </aside>
 </main>
@@ -102,10 +128,13 @@ let pointMarker = null, safeMarker = null, riverMarker = null;
 map.on("click", e => analyze(e.latlng.lat, e.latlng.lng));
 
 const presetBox = document.getElementById("presets");
+// Демо-точка: тот же путь при загрузке страницы и по кнопке.
+function openDemo(r) { map.setView([r.cell.lat, r.cell.lon], 11); return analyze(r.cell.lat, r.cell.lon, true); }
 for (const r of RIVERS) {
   const b = document.createElement("button");
-  b.textContent = r.name;
-  b.onclick = () => { map.setView([r.cell.lat, r.cell.lon], 11); analyze(r.cell.lat, r.cell.lon); };
+  b.className = "hbtn";
+  b.textContent = "Демо: " + (r.name.split(" · ")[1] || r.name);
+  b.onclick = () => openDemo(r);
   presetBox.appendChild(b);
 }
 
@@ -501,13 +530,32 @@ function drawChart(canvas, series, th, split = series.length, markDate = null, u
 }
 
 // ---------- Панель ----------
+// Уровень «сейчас» для карточки «Вода» и плитки: максимум из текущего расхода и пика прогноза.
+function waterLevelNow(th, live) {
+  const now = live.recent[live.recent.length - 1];
+  const fcPeak = live.fc.reduce((m, p) => (!m || p.q > m.q ? p : m), null);
+  return Math.max(levelOf(now.q, th), fcPeak ? levelOf(fcPeak.q, th) : 0);
+}
+// Когда весной 2024 ECOPOINT впервые поднял бы каждый уровень и за сколько дней до пика на гидропосту.
+function signalLeads(river) {
+  const th = river.thresholds, out = [];
+  if (!th || !river.spring2024) return out;
+  for (const [k, q] of [[1, th.q2], [2, th.q5], [3, th.q10]]) {
+    const first = river.spring2024.find(s => s.q >= q);
+    if (!first) continue;
+    const lead = river.known_peak
+      ? Math.round((new Date(river.known_peak.date) - new Date(first.t)) / 864e5) : null;
+    out.push({ k, t: first.t, lead });
+  }
+  return out;
+}
 function waterCard(river, live, liveError) {
   const th = river.thresholds;
   if (!th) return `<div class="card"><h3>Вода · паводки</h3><div class="muted">Для этой реки модель даёт слишком малый расход — пороги не считаются.</div></div>`;
   if (liveError) return `<div class="card"><h3>Вода · паводки</h3><div class="muted">${liveError}</div></div>`;
   const now = live.recent[live.recent.length - 1];
   const fcPeak = live.fc.reduce((m, p) => (!m || p.q > m.q ? p : m), null);
-  const lv = LEVELS[Math.max(levelOf(now.q, th), fcPeak ? levelOf(fcPeak.q, th) : 0)];
+  const lv = LEVELS[waterLevelNow(th, live)];
   return `<div class="card"><h3>Вода · паводки — ${river.name}</h3>
     <div class="level" style="color:${lv.color}">${lv.name}</div>
     <div class="muted">${lv.text}</div>
@@ -534,15 +582,9 @@ function checkCard(river) {
   }
   const lv = LEVELS[levelOf(p.q, th)];
   // Когда весной 2024 ECOPOINT впервые поднял бы каждый уровень (по реанализу, не по архивному прогнозу).
-  let crossings = "";
-  for (const [k, q] of [[1, th.q2], [2, th.q5], [3, th.q10]]) {
-    const first = river.spring2024.find(s => s.q >= q);
-    if (!first) continue;
-    const lead = river.known_peak
-      ? Math.round((new Date(river.known_peak.date) - new Date(first.t)) / 864e5) : null;
-    crossings += `<div class="row"><span style="color:${LEVELS[k].color}">«${LEVELS[k].name}»</span>
-      <b>${first.t}${lead != null ? ` · за ${lead} дн. до пика на гидропосту` : ""}</b></div>`;
-  }
+  const crossings = signalLeads(river).map(({ k, t, lead }) =>
+    `<div class="row"><span style="color:${LEVELS[k].color}">«${LEVELS[k].name}»</span>
+      <b>${t}${lead != null ? ` · за ${lead} дн. до пика на гидропосту` : ""}</b></div>`).join("");
   return `<div class="card"><h3>Проверка: весна 2024</h3>
     <canvas id="chart2024"></canvas>
     <div class="row"><span>Пик по модели</span><b>${fmt(p.q)} м³/с · ${p.t}</b></div>
@@ -742,7 +784,50 @@ const DISCLAIMER = `<div class="card warn">Это подсказка по отк
   Расход реки — не уровень воды у дома, а рельеф с шагом ~90 м не видит дамб и насыпей.
   Следуйте указаниям МЧС. Данные: GloFAS (Copernicus) через Open-Meteo, рельеф — Copernicus DEM, CC BY 4.0.</div>`;
 
-async function analyze(lat, lon) {
+// ---------- Сводка и вкладки (только отображение) ----------
+const TABS = [["water", "Вода"], ["check", "Проверка 2024"], ["bank", "Резерв и банк"], ["air", "Воздух"], ["energy", "Энергия"], ["waste", "Отходы"]];
+let currentTab = "water", tabDraw = {}, runSeq = 0;
+function showTab(id) {
+  currentTab = id;
+  panel.querySelectorAll(".tabs button").forEach(b => b.setAttribute("aria-selected", b.dataset.tab === id));
+  panel.querySelectorAll(".tabpane").forEach(p => (p.hidden = p.dataset.pane !== id));
+  if (tabDraw[id]) tabDraw[id]();
+}
+let resizeT = null;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => { map.invalidateSize(); if (tabDraw[currentTab]) tabDraw[currentTab](); }, 150);
+});
+const tile = (k, v, s, color = "var(--line)") =>
+  `<div class="tile" style="border-top-color:${color}"><div class="k">${k}</div><div class="v" style="color:${color === "var(--line)" ? "var(--text)" : color}">${v}</div><div class="s">${s}</div></div>`;
+// Три плитки: все значения — из тех же функций, что и карточки (waterLevelNow, floodForecast, signalLeads).
+function summaryTiles(near, live, liveError) {
+  const none = "нет проверенной реки";
+  if (!near || !near.river.thresholds)
+    return `<div class="tiles">${tile("Риск сейчас", "—", none)}${tile("До опасности", "—", none)}${tile("Проверка 2024", "—", none)}</div>`;
+  const river = near.river;
+  let risk, until;
+  if (liveError || !live) {
+    risk = tile("Риск сейчас", "нет данных", liveError || "нет ответа");
+    until = tile("До опасности", "нет данных", "прогноз не загрузился");
+  } else {
+    const lv = LEVELS[waterLevelNow(river.thresholds, live)];
+    risk = tile("Риск сейчас", lv.name, river.name, lv.color);
+    const f = floodForecast(river, live);
+    until = f && f.level >= 1
+      ? tile("До опасности", f.inDays > 0 ? `через ${f.inDays} дн.` : "сейчас", `первый день ≥ «${LEVELS[1].name}»`, LEVELS[1].color)
+      : tile("До опасности", "угрозы нет", "в прогнозе на 30 дн.");
+  }
+  const leads = signalLeads(river).map(c => c.lead).filter(x => x != null);
+  const lo = Math.min(...leads), hi = Math.max(...leads);
+  const check = leads.length
+    ? tile("Проверка 2024", `за ${lo === hi ? lo : `${lo}–${hi}`} дн.`, "сигнал до пика на посту, по реанализу", "var(--l0)")
+    : tile("Проверка 2024", "—", "нет данных гидропоста");
+  return `<div class="tiles">${risk}${until}${check}</div>`;
+}
+
+async function analyze(lat, lon, demo = false) {
+  const run = ++runSeq;
   if (pointMarker) map.removeLayer(pointMarker);
   pointMarker = L.marker([lat, lon]).addTo(map);
   if (!RIVERS.length) {
@@ -764,30 +849,42 @@ async function analyze(lat, lon) {
   const air = await airP;
   const sol = await solP;
 
-  let html = `<div class="card"><h3>Место</h3><div class="row"><span>Выбранная точка</span><b>${lat.toFixed(4)}, ${lon.toFixed(4)}</b></div>`;
-  if (near) html += `<div class="row"><span>Ячейка реки в модели</span><b>~${fmt(near.dist, 1)} км</b></div>`;
-  html += `</div>`;
-  if (near) html += waterCard(near.river, live, liveError)
-    + smsCard(lat, lon, near.river, live, terrain) + actionsCard() + checkCard(near.river) + reserveCard(near.river) + bankCard(near.river);
-  else html += `<div class="card"><h3>Вода · паводки</h3><div class="muted">В MVP есть реки: ${RIVERS.map(r => r.name).join(", ")}.
+  if (run !== runSeq) return null; // пока ждали ответы, выбрали другую точку
+
+  const noRiver = `<div class="card"><h3>Вода · паводки</h3><div class="muted">В MVP есть реки: ${RIVERS.map(r => r.name).join(", ")}.
     Эта точка дальше ${MAX_SNAP_KM} км от них.</div></div>`;
-  html += airCard(air, airError);
-  html += energyCard(sol, solError);
-  html += wasteCard(lat, lon);
-  html += terrain ? terrainCard(terrain) : `<div class="card"><h3>Рельеф</h3><div class="muted">Не удалось загрузить рельеф: ${terrainError || "нет ответа"}</div></div>`;
+  const noRiverShort = `<div class="card"><div class="muted">Для этой точки нет проверенной реки.</div></div>`;
+  const terrainHtml = terrain ? terrainCard(terrain) : `<div class="card"><h3>Рельеф</h3><div class="muted">Не удалось загрузить рельеф: ${terrainError || "нет ответа"}</div></div>`;
+  const panes = {
+    water: near ? waterCard(near.river, live, liveError) + smsCard(lat, lon, near.river, live, terrain) + actionsCard() + terrainHtml
+                : noRiver + terrainHtml,
+    check: near ? checkCard(near.river) || noRiverShort : noRiverShort,
+    bank: near ? reserveCard(near.river) + bankCard(near.river) || noRiverShort : noRiverShort,
+    air: airCard(air, airError),
+    energy: energyCard(sol, solError) || `<div class="card"><div class="muted">Нет прогноза солнца для этой точки.</div></div>`,
+    waste: wasteCard(lat, lon),
+  };
+  let html = demo ? `<span class="demo-badge">Демонстрационная точка · ${near ? near.river.name : ""}</span>` : "";
+  html += `<div class="place">Точка ${lat.toFixed(4)}, ${lon.toFixed(4)}${near ? ` · ячейка реки в модели ~${fmt(near.dist, 1)} км` : ""}</div>`;
+  html += summaryTiles(near, live, liveError);
+  html += `<div class="tabs" role="tablist">${TABS.map(([id, name]) =>
+    `<button role="tab" data-tab="${id}" aria-selected="false" onclick="showTab('${id}')">${name}</button>`).join("")}</div>`;
+  html += TABS.map(([id]) => `<div class="tabpane" data-pane="${id}" hidden>${panes[id]}</div>`).join("");
   html += DISCLAIMER + `<div class="muted">Пороги рассчитаны: ${DATA.generated || "—"}</div>`;
   panel.innerHTML = html;
 
-  if (near && live && near.river.thresholds) {
-    drawChart(document.getElementById("chartNow"), [...live.recent, ...live.fc], near.river.thresholds, live.recent.length);
-  }
-  const cAir = document.getElementById("chartAir");
-  if (cAir && air) drawChart(cAir, air, AIR_TH, air.length, null, "мкг/м³");
-  const cSun = document.getElementById("chartSun");
-  if (cSun && sol) drawChart(cSun, sol.hours, null, sol.hours.length, null, "кВт·ч");
-  const c24 = document.getElementById("chart2024");
-  if (c24) drawChart(c24, near.river.spring2024, near.river.thresholds, near.river.spring2024.length, near.river.known_peak?.date);
+  // Графики рисуются при открытии вкладки: у canvas в скрытом блоке ширина 0.
+  tabDraw = {
+    water: () => { if (near && live && near.river.thresholds)
+      drawChart(document.getElementById("chartNow"), [...live.recent, ...live.fc], near.river.thresholds, live.recent.length); },
+    check: () => { const c24 = document.getElementById("chart2024");
+      if (c24) drawChart(c24, near.river.spring2024, near.river.thresholds, near.river.spring2024.length, near.river.known_peak?.date); },
+    bank: () => { const sl = document.getElementById("resT"); if (sl && sl.oninput) sl.oninput(); },
+    air: () => { const c = document.getElementById("chartAir"); if (c && air) drawChart(c, air, AIR_TH, air.length, null, "мкг/м³"); },
+    energy: () => { const c = document.getElementById("chartSun"); if (c && sol) drawChart(c, sol.hours, null, sol.hours.length, null, "кВт·ч"); },
+  };
   if (near) { bindReserve(near.river); bindBank(); }
+  showTab(currentTab);
 
   drawWasteMarkers();
   if (riverMarker) map.removeLayer(riverMarker);
@@ -901,6 +998,9 @@ function stopWatch(msg = "Слежение выключено.") {
 }
 document.getElementById("geoBtn").onclick = locateMe;
 watchBox.onchange = () => (watchBox.checked ? startWatch() : stopWatch());
+
+// При загрузке сразу открываем демо-точку (тот же путь, что кнопка «Демо»).
+if (RIVERS.length) openDemo(RIVERS[0]);
 </script>
 <div id="alert" class="alert" hidden></div>
 </body>
