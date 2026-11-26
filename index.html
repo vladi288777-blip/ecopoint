@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ECOPOINT — экологический паспорт места</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --bg:#0f1417; --card:#182026; --text:#e6edf0; --muted:#8a9aa3; --line:#2a353d;
+          --l0:#3fb950; --l1:#d29922; --l2:#f0883e; --l3:#f85149; --accent:#38bdf8; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:12px 20px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
+  header b { font-size:20px; letter-spacing:1px; }
+  header span { color:var(--muted); font-size:14px; }
+  #presets button { background:var(--card); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:4px 10px; margin-right:6px; cursor:pointer; }
+  #presets button:hover { border-color:var(--accent); }
+  main { display:grid; grid-template-columns: 1fr 440px; height:calc(100vh - 56px); }
+  #map { height:100%; }
+  aside { overflow-y:auto; padding:16px; border-left:1px solid var(--line); }
+  .card { background:var(--card); border-radius:10px; padding:14px; margin-bottom:12px; }
+  .card h3 { margin:0 0 8px; font-size:15px; }
+  .muted { color:var(--muted); font-size:13px; }
+  .level { font-size:22px; font-weight:700; margin:4px 0; }
+  .row { display:flex; justify-content:space-between; gap:12px; font-size:14px; padding:3px 0; border-bottom:1px dashed var(--line); }
+  .row:last-child { border-bottom:none; }
+  .row b { text-align:right; }
+  canvas { width:100%; height:170px; margin-top:6px; }
+  .warn { font-size:12px; color:var(--muted); border-left:3px solid var(--l1); padding-left:8px; }
+  @media (max-width: 800px) { main { grid-template-columns:1fr; grid-template-rows: 45vh auto; height:auto; } aside { border-left:none; } }
+</style>
+</head>
+<body>
+<header><b>ECOPOINT</b><span>нажмите на карту или выберите точку:</span><div id="presets"></div></header>
+<main>
+  <div id="map"></div>
+  <aside id="panel">
+    <div class="card">
+      <h3>Как пользоваться</h3>
+      <div class="muted">Выберите реку вверху или нажмите на место рядом с ней. Модуль «Вода» покажет
+      уровень паводковой угрозы, прогноз на 30 дней, проверку на паводке 2024 года и рельеф вокруг.</div>
+    </div>
+  </aside>
+</main>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<!-- Предрасчёт: python3 tools/precompute.py -->
+<script src="data/rivers.js"></script>
+<script>
+// ---------- Настройки ----------
+const DATA = window.RIVERS || { rivers: [] };
+// Только реки, где модель прошла проверку на паводке 2024 года.
+// Тобол (Костанай): пик 2024 по модели 47 м³/с — модель не видит зарегулированную реку.
+// Жем (Кульсары): расход ~0 — пересыхающая степная река не видна в сетке 5 км.
+const VALIDATED = ["ural-uralsk"];
+const RIVERS = DATA.rivers.filter(r => VALIDATED.includes(r.id) && r.thresholds);
+const MAX_SNAP_KM = 30;                    // клик дальше от известной реки — «нет данных»
+const RINGS_M = [250, 500, 1000, 2000];   // радиусы поиска возвышенности
+const DIRECTIONS = 8;
+const SAFE_RISE_M = 5;
+const LEVELS = [
+  { name: "Норма",             color: "var(--l0)", text: "Расход реки ниже обычного весеннего пика." },
+  { name: "Внимание",          color: "var(--l1)", text: "Как обычный весенний пик (бывает примерно раз в 2 года)." },
+  { name: "Опасность",         color: "var(--l2)", text: "Сильный паводок (примерно раз в 5 лет и реже)." },
+  { name: "Высокая опасность", color: "var(--l3)", text: "Редкий паводок (примерно раз в 10 лет и реже)." },
+];
+
+// ---------- Карта ----------
+const map = L.map("map").setView([51.2333, 51.3667], 10);
+// tile.openstreetmap.org отдаёт 403 без Referer (файл открыт без сервера) — тогда по умолчанию спутник Esri.
+const osm = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19, attribution: "© OpenStreetMap contributors" });
+const sat = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {
+  maxZoom: 18, attribution: "Tiles © Esri — Esri, Maxar, Earthstar Geographics" });
+(location.protocol === "file:" ? sat : osm).addTo(map);
+L.control.layers({ "Карта (OSM)": osm, "Спутник (Esri)": sat }).addTo(map);
+
+let pointMarker = null, safeMarker = null, riverMarker = null;
+map.on("click", e => analyze(e.latlng.lat, e.latlng.lng));
+
+const presetBox = document.getElementById("presets");
+for (const r of RIVERS) {
+  const b = document.createElement("button");
+  b.textContent = r.name;
+  b.onclick = () => { map.setView([r.cell.lat, r.cell.lon], 11); analyze(r.cell.lat, r.cell.lon); };
+  presetBox.appendChild(b);
+}
+
+// ---------- Утилиты ----------
+const panel = document.getElementById("panel");
+const isoDate = d => d.toISOString().slice(0, 10);
+const fmt = (x, d = 0) => x == null ? "—" : x.toLocaleString("ru-RU", { maximumFractionDigits: d });
+
+async function getJSON(url) {
+  const r = await fetch(url);
+  if (r.status === 429) throw new Error("Лимит запросов Open-Meteo. Подождите минуту и попробуйте снова.");
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+const toSeries = daily => daily.time
+  .map((t, i) => ({ t, q: daily.river_discharge[i] }))
+  .filter(p => p.q != null);
+
+function distKm(aLat, aLon, bLat, bLon) {
+  const dLat = (bLat - aLat) * 111.32;
+  const dLon = (bLon - aLon) * 111.32 * Math.cos(aLat * Math.PI / 180);
+  return Math.hypot(dLat, dLon);
+}
+function offsetPoint(lat, lon, distM, angle) {
+  const dLat = distM * Math.cos(angle) / 111320;
+  const dLon = distM * Math.sin(angle) / (111320 * Math.cos(lat * Math.PI / 180));
+  return [lat + dLat, lon + dLon];
+}
+function levelOf(q, th) {
+  if (q >= th.q10) return 3;
+  if (q >= th.q5) return 2;
+  if (q >= th.q2) return 1;
+  return 0;
+}
+function nearestRiver(lat, lon) {
+  let best = null;
+  for (const r of RIVERS) {
+    const d = distKm(lat, lon, r.cell.lat, r.cell.lon);
+    if (!best || d < best.dist) best = { river: r, dist: d };
+  }
+  return best && best.dist <= MAX_SNAP_KM ? best : null;
+}
+
+// ---------- Данные (лёгкие запросы на каждый клик) ----------
+// 90 дней истории + 30 дней прогноза: ~10 «вызовов» Open-Meteo вместо тысяч.
+async function fetchRecent(cell) {
+  const today = new Date();
+  const base = `https://flood-api.open-meteo.com/v1/flood?latitude=${cell.lat}&longitude=${cell.lon}&daily=river_discharge`;
+  const [recent, fc] = await Promise.all([
+    getJSON(`${base}&start_date=${isoDate(new Date(today - 89 * 864e5))}&end_date=${isoDate(today)}`),
+    getJSON(`${base}&forecast_days=30`),
+  ]);
+  const t0 = isoDate(today);
+  return { recent: toSeries(recent.daily), fc: toSeries(fc.daily).filter(p => p.t > t0) };
+}
+
+async function fetchTerrain(lat, lon) {
+  const pts = [{ lat, lon, dist: 0 }];
+  for (const r of RINGS_M)
+    for (let k = 0; k < DIRECTIONS; k++) {
+      const [a, b] = offsetPoint(lat, lon, r, (2 * Math.PI * k) / DIRECTIONS);
+      pts.push({ lat: a, lon: b, dist: r });
+    }
+  const url = `https://api.open-meteo.com/v1/elevation?latitude=${pts.map(p => p.lat.toFixed(5)).join(",")}`
+            + `&longitude=${pts.map(p => p.lon.toFixed(5)).join(",")}`;
+  const data = await getJSON(url);
+  pts.forEach((p, i) => (p.h = data.elevation[i]));
+  const h0 = pts[0].h;
+  const lowest = Math.min(...pts.map(p => p.h));
+  const safe = pts.slice(1).filter(p => p.h >= h0 + SAFE_RISE_M)
+    .sort((a, b) => a.dist - b.dist || b.h - a.h)[0] || null;
+  return { h0, aboveLowest: h0 - lowest, safe };
+}
+
+// ---------- Воздух ----------
+// Прогноз CAMS через Open-Meteo Air Quality API (~11 км — оценка по району, не по дому).
+// Пороги PM2.5 по суточной шкале US EPA (мкг/м³): до 12 — хорошо, до 35 — умеренно,
+// до 55 — вредно для чувствительных групп, выше — вредно для всех.
+const AIR_TH = { q2: 12, q5: 35, q10: 55 };
+const AIR_LEVELS = [
+  { name: "Хороший воздух", color: "var(--l0)" },
+  { name: "Умеренно",       color: "var(--l1)" },
+  { name: "Вредно для детей, пожилых и астматиков", color: "var(--l2)" },
+  { name: "Вредно для всех", color: "var(--l3)" },
+];
+async function fetchAir(lat, lon) {
+  const url = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat.toFixed(4)}&longitude=${lon.toFixed(4)}`
+            + `&hourly=pm2_5,pm10&forecast_days=2&timezone=auto`;
+  const d = await getJSON(url);
+  const nowHour = new Date().getHours();
+  const todayStr = d.hourly.time[0].slice(0, 10);
+  const all = d.hourly.time.map((t, i) => ({ t, q: d.hourly.pm2_5[i], pm10: d.hourly.pm10[i] }))
+    .filter(p => p.q != null);
+  // следующие 24 часа от текущего часа (время — местное для точки)
+  const start = all.findIndex(p => p.t.slice(0, 10) > todayStr || +p.t.slice(11, 13) >= nowHour);
+  return all.slice(Math.max(start, 0), Math.max(start, 0) + 24);
+}
+const dm = t => `${t.slice(8, 10)}.${t.slice(5, 7)}`;   // "2026-11-26T18:00" → "26.11"
+// Лучшее и худшее 3-часовое окно: когда проветривать и когда закрыть окна.
+function airWindows(s) {
+  let best = null, worst = null;
+  for (let i = 0; i + 3 <= s.length; i++) {
+    const avg = (s[i].q + s[i + 1].q + s[i + 2].q) / 3;
+    if (!best || avg < best.avg) best = { i, avg };
+    if (!worst || avg > worst.avg) worst = { i, avg };
+  }
+  const hh = i => s[i].t.slice(11, 16);
+  const span = w => `${dm(s[w.i].t)} ${hh(w.i)}–${hh(Math.min(w.i + 3, s.length - 1))}`;
+  return { best: best && { ...best, label: span(best) }, worst: worst && { ...worst, label: span(worst) } };
+}
+function airCard(s, error) {
+  if (error) return `<div class="card"><h3>Воздух</h3><div class="muted">${error}</div></div>`;
+  if (!s || !s.length) return `<div class="card"><h3>Воздух</h3><div class="muted">Нет прогноза для этой точки.</div></div>`;
+  const peak = s.reduce((m, p) => (p.q > m.q ? p : m));
+  const lv = AIR_LEVELS[levelOf(peak.q, AIR_TH)];
+  const w = airWindows(s);
+  let advice = "Особых ограничений нет.";
+  if (!w.best) advice = "Мало данных прогноза для советов.";
+  else if (levelOf(peak.q, AIR_TH) >= 2) advice = `Закройте окна ${w.worst.label}. Прогулки с детьми — лучше ${w.best.label}.`;
+  else if (levelOf(peak.q, AIR_TH) === 1) advice = `Проветривайте ${w.best.label} — в это время воздух чище всего.`;
+  return `<div class="card"><h3>Воздух · следующие 24 часа</h3>
+    <div class="level" style="color:${lv.color}">${lv.name}</div>
+    <div class="muted">${advice}</div>
+    <canvas id="chartAir"></canvas>
+    <div class="muted">PM2.5 по часам. Пунктир — 12 / 35 / 55 мкг/м³.</div>
+    <div class="row"><span>Пик PM2.5</span><b>${fmt(peak.q)} мкг/м³ · ${dm(peak.t)} ${peak.t.slice(11, 16)}</b></div>
+    <div class="row"><span>Лучшее время проветрить</span><b>${w.best ? w.best.label : "—"}</b></div>
+    <div class="row"><span>Хуже всего</span><b>${w.worst ? w.worst.label : "—"}</b></div>
+    <div class="muted">Прогноз CAMS (~11 км) — оценка по району, не по конкретному дому.</div>
+  </div>`;
+}
+
+// ---------- График ----------
+// series: [{t,q}]; split: с этого индекса — прогноз (голубым); markDate: вертикальная отметка.
+function drawChart(canvas, series, th, split = series.length, markDate = null, unit = "м³/с") {
+  if (!series.length) return;
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  const ctx = canvas.getContext("2d"); ctx.scale(dpr, dpr);
+  const maxQ = Math.max(th.q10, ...series.map(p => p.q)) * 1.1;
+  const pad = { l: 46, r: 8, t: 10, b: 18 };
+  const x = i => pad.l + (i / Math.max(series.length - 1, 1)) * (W - pad.l - pad.r);
+  const y = q => H - pad.b - (q / maxQ) * (H - pad.t - pad.b);
+  ctx.font = "11px system-ui"; ctx.fillStyle = "#8a9aa3";
+  [[th.q2, "#d29922"], [th.q5, "#f0883e"], [th.q10, "#f85149"]].forEach(([q, c]) => {
+    ctx.strokeStyle = c; ctx.setLineDash([4, 4]); ctx.beginPath();
+    ctx.moveTo(pad.l, y(q)); ctx.lineTo(W - pad.r, y(q)); ctx.stroke();
+  });
+  ctx.setLineDash([]);
+  if (markDate) {
+    const i = series.findIndex(p => p.t >= markDate);
+    if (i >= 0) {
+      ctx.strokeStyle = "#3fb950"; ctx.beginPath();
+      ctx.moveTo(x(i), pad.t); ctx.lineTo(x(i), H - pad.b); ctx.stroke();
+      ctx.fillStyle = "#3fb950"; ctx.fillText("гидропост", x(i) + 3, pad.t + 10); ctx.fillStyle = "#8a9aa3";
+    }
+  }
+  const line = (from, to, color) => {
+    if (to <= from) return;
+    ctx.strokeStyle = color; ctx.lineWidth = 1.6; ctx.beginPath();
+    for (let i = from; i <= to; i++) i === from ? ctx.moveTo(x(i), y(series[i].q)) : ctx.lineTo(x(i), y(series[i].q));
+    ctx.stroke();
+  };
+  line(0, Math.min(split, series.length) - 1, "#e6edf0");
+  line(Math.max(split - 1, 0), series.length - 1, "#38bdf8");
+  ctx.fillText(`${fmt(maxQ)} ${unit}`, 2, pad.t + 8);
+  ctx.fillText("0", 2, H - pad.b);
+  ctx.fillText(series[0].t, pad.l, H - 4);
+  const last = series[series.length - 1].t;
+  ctx.fillText(last, W - pad.r - ctx.measureText(last).width, H - 4);
+}
+
+// ---------- Панель ----------
+function waterCard(river, live, liveError) {
+  const th = river.thresholds;
+  if (!th) return `<div class="card"><h3>Вода · паводки</h3><div class="muted">Для этой реки модель даёт слишком малый расход — пороги не считаются.</div></div>`;
+  if (liveError) return `<div class="card"><h3>Вода · паводки</h3><div class="muted">${liveError}</div></div>`;
+  const now = live.recent[live.recent.length - 1];
+  const fcPeak = live.fc.reduce((m, p) => (!m || p.q > m.q ? p : m), null);
+  const lv = LEVELS[Math.max(levelOf(now.q, th), fcPeak ? levelOf(fcPeak.q, th) : 0)];
+  return `<div class="card"><h3>Вода · паводки — ${river.name}</h3>
+    <div class="level" style="color:${lv.color}">${lv.name}</div>
+    <div class="muted">${lv.text}</div>
+    <canvas id="chartNow"></canvas>
+    <div class="muted">Белое — последние 90 дней, голубое — прогноз на 30 дней. Пунктир — пороги «раз в 2 / 5 / 10 лет».</div>
+    <div class="row"><span>Расход сейчас</span><b>${fmt(now.q)} м³/с</b></div>
+    <div class="row"><span>Пик прогноза</span><b>${fcPeak ? `${fmt(fcPeak.q)} м³/с · ${fcPeak.t}` : "—"}</b></div>
+    <div class="row"><span>Обычный весенний пик</span><b>${fmt(th.q2)} м³/с</b></div>
+    <div class="row"><span>Лет истории</span><b>${th.years}</b></div>
+  </div>`;
+}
+
+function checkCard(river) {
+  const th = river.thresholds, p = river.peak2024;
+  if (!th || !p) return "";
+  let verdict = "";
+  if (river.known_peak) {
+    const days = Math.round((new Date(p.t) - new Date(river.known_peak.date)) / 864e5);
+    const ok = Math.abs(days) <= 7;
+    verdict = `<div class="row"><span>Пик на гидропосту</span><b>${river.known_peak.date}</b></div>
+      <div class="row"><span>Сдвиг даты пика</span><b style="color:${ok ? "var(--l0)" : "var(--l3)"}">
+        ${days >= 0 ? "+" : ""}${days} дн. · ${ok ? "совпадает" : "не совпадает"}</b></div>
+      <div class="muted">${river.known_peak.note}. Сравниваем только дату: модель даёт расход, гидропост — уровень.</div>`;
+  }
+  const lv = LEVELS[levelOf(p.q, th)];
+  // Когда весной 2024 ECOPOINT впервые поднял бы каждый уровень (по реанализу, не по архивному прогнозу).
+  let crossings = "";
+  for (const [k, q] of [[1, th.q2], [2, th.q5], [3, th.q10]]) {
+    const first = river.spring2024.find(s => s.q >= q);
+    if (!first) continue;
+    const lead = river.known_peak
+      ? Math.round((new Date(river.known_peak.date) - new Date(first.t)) / 864e5) : null;
+    crossings += `<div class="row"><span style="color:${LEVELS[k].color}">«${LEVELS[k].name}»</span>
+      <b>${first.t}${lead != null ? ` · за ${lead} дн. до пика на гидропосту` : ""}</b></div>`;
+  }
+  return `<div class="card"><h3>Проверка: весна 2024</h3>
+    <canvas id="chart2024"></canvas>
+    <div class="row"><span>Пик по модели</span><b>${fmt(p.q)} м³/с · ${p.t}</b></div>
+    <div class="row"><span>Уровень, который выдал бы ECOPOINT</span><b style="color:${lv.color}">${lv.name}</b></div>
+    ${verdict}
+    ${crossings ? `<h3 style="margin-top:10px">Когда сработал бы сигнал</h3>${crossings}
+      <div class="muted">По реанализу GloFAS — «что показала бы система в тот день», а не архивный прогноз.</div>` : ""}
+  </div>`;
+}
+
+function terrainCard(t) {
+  return `<div class="card"><h3>Рельеф вокруг</h3>
+    <div class="row"><span>Высота места</span><b>${fmt(t.h0)} м</b></div>
+    <div class="row"><span>Выше самой низкой точки в радиусе 2 км</span><b>${fmt(t.aboveLowest, 1)} м</b></div>
+    <div class="row"><span>Ближайшая возвышенность (+${SAFE_RISE_M} м)</span><b>${t.safe ? `~${fmt(t.safe.dist)} м, ${fmt(t.safe.h)} м` : "в радиусе 2 км нет"}</b></div>
+  </div>`;
+}
+
+const DISCLAIMER = `<div class="card warn">Это подсказка по открытым моделям, а не официальная карта эвакуации.
+  Расход реки — не уровень воды у дома, а рельеф с шагом ~90 м не видит дамб и насыпей.
+  Следуйте указаниям МЧС. Данные: GloFAS (Copernicus) через Open-Meteo, рельеф — Copernicus DEM, CC BY 4.0.</div>`;
+
+async function analyze(lat, lon) {
+  if (pointMarker) map.removeLayer(pointMarker);
+  pointMarker = L.marker([lat, lon]).addTo(map);
+  if (!RIVERS.length) {
+    panel.innerHTML = `<div class="card"><h3>Нет данных о реках</h3><div class="muted">Сначала запустите <code>python3 tools/precompute.py</code>.</div></div>`;
+    return;
+  }
+  panel.innerHTML = `<div class="card"><h3>Считаю…</h3><div class="muted">Загружаю свежий расход, прогноз и рельеф.</div></div>`;
+
+  const near = nearestRiver(lat, lon);
+  const terrainP = fetchTerrain(lat, lon).catch(() => null);
+  let airError = null;
+  const airP = fetchAir(lat, lon).catch(e => { airError = e.message; return null; });
+  let live = null, liveError = null;
+  if (near) { try { live = await fetchRecent(near.river.cell); } catch (e) { liveError = e.message; } }
+  const terrain = await terrainP;
+  const air = await airP;
+
+  let html = `<div class="card"><h3>Место</h3><div class="row"><span>Выбранная точка</span><b>${lat.toFixed(4)}, ${lon.toFixed(4)}</b></div>`;
+  if (near) html += `<div class="row"><span>Ячейка реки в модели</span><b>~${fmt(near.dist, 1)} км</b></div>`;
+  html += `</div>`;
+  if (near) html += waterCard(near.river, live, liveError) + checkCard(near.river);
+  else html += `<div class="card"><h3>Вода · паводки</h3><div class="muted">В MVP есть реки: ${RIVERS.map(r => r.name).join(", ")}.
+    Эта точка дальше ${MAX_SNAP_KM} км от них.</div></div>`;
+  html += airCard(air, airError);
+  html += terrain ? terrainCard(terrain) : `<div class="card"><h3>Рельеф</h3><div class="muted">Не удалось загрузить рельеф.</div></div>`;
+  html += DISCLAIMER + `<div class="muted">Пороги рассчитаны: ${DATA.generated || "—"}</div>`;
+  panel.innerHTML = html;
+
+  if (near && live && near.river.thresholds) {
+    drawChart(document.getElementById("chartNow"), [...live.recent, ...live.fc], near.river.thresholds, live.recent.length);
+  }
+  const cAir = document.getElementById("chartAir");
+  if (cAir && air) drawChart(cAir, air, AIR_TH, air.length, null, "мкг/м³");
+  const c24 = document.getElementById("chart2024");
+  if (c24) drawChart(c24, near.river.spring2024, near.river.thresholds, near.river.spring2024.length, near.river.known_peak?.date);
+
+  if (riverMarker) map.removeLayer(riverMarker);
+  if (near) riverMarker = L.circleMarker([near.river.cell.lat, near.river.cell.lon], { radius: 7, color: "#38bdf8" })
+    .addTo(map).bindTooltip("Ячейка реки, по которой считается расход");
+  if (safeMarker) map.removeLayer(safeMarker);
+  if (terrain && terrain.safe) safeMarker = L.circleMarker([terrain.safe.lat, terrain.safe.lon], { radius: 8, color: "#3fb950" })
+    .addTo(map).bindTooltip("Ближайшая возвышенность");
+}
+</script>
+</body>
+</html>
