@@ -48,11 +48,20 @@
 <header><b>ECOPOINT</b><span>нажмите на карту или выберите точку:</span><div id="presets"></div></header>
 <main>
   <div id="map"></div>
-  <aside id="panel">
-    <div class="card">
-      <h3>Как пользоваться</h3>
-      <div class="muted">Выберите реку вверху или нажмите на место рядом с ней. Модуль «Вода» покажет
-      уровень паводковой угрозы, прогноз на 30 дней, проверку на паводке 2024 года и рельеф вокруг.</div>
+  <aside>
+    <div class="card" id="geo">
+      <button class="btn" id="geoBtn" style="margin-top:0">📍 Моё место</button>
+      <label class="muted" style="margin-left:8px"><input type="checkbox" id="watchBox"> Следить (раз в 30 мин)</label>
+      <div id="geoMsg" class="muted" style="margin-top:6px" hidden></div>
+      <div class="muted" style="margin-top:6px;font-size:11px">Координаты не сохраняются; передаются только в Open-Meteo для прогноза.
+        Уведомления работают, пока сайт открыт — фоновые push требуют сервера (следующий шаг).</div>
+    </div>
+    <div id="panel">
+      <div class="card">
+        <h3>Как пользоваться</h3>
+        <div class="muted">Выберите реку вверху или нажмите на место рядом с ней. Модуль «Вода» покажет
+        уровень паводковой угрозы, прогноз на 30 дней, проверку на паводке 2024 года и рельеф вокруг.</div>
+      </div>
     </div>
   </aside>
 </main>
@@ -356,6 +365,19 @@ function showAlert(level, ctx) {
     <button class="ok" onclick="document.getElementById('alert').hidden=true">Понятно</button>`;
   el.hidden = false;
   if (level >= 2) { beep(); if (navigator.vibrate) navigator.vibrate([300, 150, 300]); }
+}
+
+// Уровень угрозы по прогнозу: максимум за 30 дней и через сколько дней впервые «Внимание» и выше.
+function floodForecast(river, live) {
+  if (!river || !river.thresholds || !live || !live.recent.length) return null;
+  const today = live.recent[live.recent.length - 1];
+  const series = [today, ...live.fc];
+  const hit = series.find(p => levelOf(p.q, river.thresholds) >= 1);
+  if (!hit) return { level: 0, inDays: 0 };
+  return {
+    level: Math.max(...series.map(p => levelOf(p.q, river.thresholds))),
+    inDays: Math.max(0, Math.round((new Date(hit.t) - new Date(today.t)) / 864e5)),
+  };
 }
 
 function smsCard(lat, lon, river, live, terrain) {
@@ -718,7 +740,111 @@ async function analyze(lat, lon) {
   if (safeMarker) map.removeLayer(safeMarker);
   if (terrain && terrain.safe) safeMarker = L.circleMarker([terrain.safe.lat, terrain.safe.lon], { radius: 8, color: "#3fb950" })
     .addTo(map).bindTooltip("Ближайшая возвышенность");
+
+  // Для геолокации и слежения: уровень по прогнозу и текст «куда идти».
+  const f = near ? floodForecast(near.river, live) : null;
+  if (!f) return null;
+  return { level: f.level, ctx: { river: near.river.name.split(" · ")[0], go: whereToGo(lat, lon, terrain), inDays: f.inDays } };
 }
+
+// ---------- Моё место, уведомления, слежение ----------
+// Без сервера: всё работает, только пока вкладка открыта. Координаты нигде не сохраняются.
+const WATCH_MS = 30 * 60 * 1000;
+const geoMsg = document.getElementById("geoMsg");
+const watchBox = document.getElementById("watchBox");
+let lastPos = null, lastLevel = null, lastCheck = 0, lastGo = null, watchId = null, watchTimer = null;
+
+function geoNote(text) { geoMsg.textContent = text; geoMsg.hidden = !text; }
+function geoErrorText(e) {
+  if (!e || e.code === undefined) return "Не удалось определить место.";
+  if (e.code === 1) return "Доступ к геолокации запрещён. Разрешите его в настройках сайта (значок слева от адреса) или нажмите на карту вручную.";
+  if (e.code === 2) return "Место не определено: нет сигнала GPS/сети. Попробуйте позже или нажмите на карту.";
+  if (e.code === 3) return "Геолокация не ответила вовремя. Попробуйте ещё раз или нажмите на карту.";
+  return "Ошибка геолокации: " + (e.message || e.code);
+}
+function geoAvailable() {
+  if (!("geolocation" in navigator)) { geoNote("Браузер не поддерживает геолокацию. Нажмите на карту вручную."); return false; }
+  if (!window.isSecureContext) { geoNote("Геолокация работает только по https или на localhost. Нажмите на карту вручную."); return false; }
+  return true;
+}
+function getPosition() {
+  return new Promise((ok, fail) => navigator.geolocation.getCurrentPosition(ok, fail,
+    { enableHighAccuracy: false, timeout: 15000, maximumAge: 10 * 60 * 1000 }));
+}
+// Разрешение на уведомления спрашиваем только по нажатию (жест пользователя).
+async function askNotify() {
+  if (!("Notification" in window) || Notification.permission !== "default") return;
+  try { await Notification.requestPermission(); } catch (e) {}
+}
+function notify(level, ctx) {
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  const when = ctx.inDays > 0 ? `через ${ctx.inDays} дн.` : "сейчас";
+  try {
+    new Notification(`ECOPOINT: ${LEVELS[level].name}`, {
+      body: `р. ${ctx.river}: подъём воды ${when.replace(/\.$/, "")}. Куда идти: ${ctx.go}`, tag: "ecopoint-flood" });
+  } catch (e) {} // Android Chrome без service worker не даёт new Notification — остаётся экранная тревога
+}
+function warn(res) { showAlert(res.level, res.ctx); notify(res.level, res.ctx); }
+
+async function locateMe() {
+  await askNotify();
+  if (!geoAvailable()) return;
+  geoNote("Определяю место…");
+  let p;
+  try { p = await getPosition(); } catch (e) { geoNote(geoErrorText(e)); return; }
+  const { latitude: lat, longitude: lon } = p.coords;
+  lastPos = { lat, lon };
+  geoNote(`Точность ~${fmt(p.coords.accuracy)} м.`);
+  map.setView([lat, lon], 13);
+  const res = await analyze(lat, lon);
+  lastCheck = Date.now();
+  if (!res) { lastLevel = 0; return; }
+  lastLevel = res.level; lastGo = { lat, lon, go: res.ctx.go };
+  if (res.level >= 1) warn(res);
+}
+
+// Тик слежения: один лёгкий запрос расхода (по ячейке реки, не по координатам), панель не перерисовываем.
+async function watchTick() {
+  if (!lastPos || Date.now() - lastCheck < WATCH_MS - 60 * 1000) return; // не чаще раза в 30 мин
+  lastCheck = Date.now();
+  const near = nearestRiver(lastPos.lat, lastPos.lon);
+  let level = 0, ctx = null;
+  if (near) {
+    let live;
+    try { live = await fetchRecent(near.river.cell); } catch (e) { geoNote("Слежение: " + e.message); return; }
+    const f = floodForecast(near.river, live);
+    if (f) {
+      level = f.level;
+      const go = lastGo && distKm(lastPos.lat, lastPos.lon, lastGo.lat, lastGo.lon) < 1
+        ? lastGo.go : whereToGo(lastPos.lat, lastPos.lon, null);
+      ctx = { river: near.river.name.split(" · ")[0], go, inDays: f.inDays };
+    }
+  }
+  const prev = lastLevel ?? 0;
+  lastLevel = level;
+  geoNote(`Проверено в ${new Date().toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}: ${LEVELS[level].name}.`);
+  if (level > prev && level >= 1) warn({ level, ctx }); // только если уровень вырос
+}
+
+async function startWatch() {
+  await askNotify();
+  if (!geoAvailable()) { watchBox.checked = false; return; }
+  watchId = navigator.geolocation.watchPosition(
+    p => { lastPos = { lat: p.coords.latitude, lon: p.coords.longitude }; },
+    e => geoNote(geoErrorText(e)),
+    { enableHighAccuracy: false, maximumAge: 10 * 60 * 1000 });
+  watchTimer = setInterval(watchTick, WATCH_MS);
+  if (!lastPos) await locateMe(); // первая проверка сразу, дальше — по таймеру
+  if (!lastPos) { stopWatch(null); watchBox.checked = false; return; } // текст ошибки уже показан
+  geoNote("Слежение включено: проверка раз в 30 мин, пока вкладка открыта.");
+}
+function stopWatch(msg = "Слежение выключено.") {
+  if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+  clearInterval(watchTimer); watchId = watchTimer = null;
+  if (msg) geoNote(msg);
+}
+document.getElementById("geoBtn").onclick = locateMe;
+watchBox.onchange = () => (watchBox.checked ? startWatch() : stopWatch());
 </script>
 <div id="alert" class="alert" hidden></div>
 </body>
