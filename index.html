@@ -266,10 +266,12 @@ function energyCard(sol, error) {
 const WASTE_CITY = { lat: 51.2333, lon: 51.3667, radiusKm: 30 };
 const WASTE_ACCEPTS = "пластиковые бутылки, бумага, картон, книги, алюминиевые банки, полиэтилен, стрейч-плёнка, ПНД-канистры, отработанное подсолнечное масло";
 const WASTE_POINTS = [
-  { name: "Экопункт №1", address: "ул. Кердери, 133 (за ТД «Школьник»)", lat: null, lon: null },
-  { name: "Экопункт №2", address: "ул. Монкеулы, 77 (Зачаганск)",         lat: null, lon: null },
-  { name: "Экопункт №3", address: "мкр им. Кадыра Мырза Али, 5",          lat: null, lon: null },
+  { name: "Экопункт №1", address: "ул. Кердери, 133 (за ТД «Школьник»)", query: "Кердери 133",         lat: null, lon: null },
+  { name: "Экопункт №2", address: "ул. Монкеулы, 77 (Зачаганск)",         query: "Монкеулы 77",         lat: null, lon: null },
+  { name: "Экопункт №3", address: "мкр им. Кадыра Мырза Али, 5",          query: "Кадыра Мырза Али 5", lat: null, lon: null },
 ];
+// Поиск адреса в 2ГИС — работает без координат.
+const gisLink = q => `https://2gis.kz/uralsk/search/${encodeURIComponent(q)}`;
 const WASTE_SOURCE = "https://informburo.kz/stati/utilizaciia-musora-delo-blagorodnoe-po-kakim-cenam-v-uralske-sdaiut-plastik-bumagu-metall";
 let wasteMarkers = [];
 
@@ -280,7 +282,7 @@ function wasteCard(lat, lon) {
     .map(p => ({ ...p, d: p.lat != null ? distKm(lat, lon, p.lat, p.lon) : null }))
     .sort((a, b) => (a.d ?? 1e9) - (b.d ?? 1e9));
   const rows = pts.map(p => `<div class="row"><span>${p.name}<br><span class="muted">${p.address}</span></span>
-    <b>${p.d != null ? `~${fmt(p.d, 1)} км` : ""}</b></div>`).join("");
+    <b>${p.d != null ? `~${fmt(p.d, 1)} км<br>` : ""}<a href="${gisLink(p.query)}" target="_blank" rel="noopener" style="color:var(--accent)">в 2ГИС</a></b></div>`).join("");
   return `<div class="card"><h3>Отходы · куда сдать</h3>
     <div class="muted">В Казахстане реальное вторсырьё получают примерно из 1,1% отходов: остальное можно вернуть в оборот, если сдать отдельно.</div>
     ${rows}
