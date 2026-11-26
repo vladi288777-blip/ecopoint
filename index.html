@@ -172,13 +172,13 @@ async function fetchAir(lat, lon) {
   const url = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat.toFixed(4)}&longitude=${lon.toFixed(4)}`
             + `&hourly=pm2_5,pm10&forecast_days=2&timezone=auto`;
   const d = await getJSON(url);
-  const nowHour = new Date().getHours();
-  const todayStr = d.hourly.time[0].slice(0, 10);
+  // Время в ответе — местное для точки. Текущий час считаем по её поясу (utc_offset_seconds),
+  // а не по часам браузера: у пользователя система может быть в UTC.
+  const nowLocal = new Date(Date.now() + (d.utc_offset_seconds || 0) * 1000).toISOString().slice(0, 13);
   const all = d.hourly.time.map((t, i) => ({ t, q: d.hourly.pm2_5[i], pm10: d.hourly.pm10[i] }))
     .filter(p => p.q != null);
-  // следующие 24 часа от текущего часа (время — местное для точки)
-  const start = all.findIndex(p => p.t.slice(0, 10) > todayStr || +p.t.slice(11, 13) >= nowHour);
-  return all.slice(Math.max(start, 0), Math.max(start, 0) + 24);
+  const start = Math.max(all.findIndex(p => p.t.slice(0, 13) >= nowLocal), 0);
+  return all.slice(start, start + 24);
 }
 const dm = t => `${t.slice(8, 10)}.${t.slice(5, 7)}`;   // "2026-11-26T18:00" → "26.11"
 // Лучшее и худшее 3-часовое окно: когда проветривать и когда закрыть окна.
@@ -331,7 +331,8 @@ async function analyze(lat, lon) {
   panel.innerHTML = `<div class="card"><h3>Считаю…</h3><div class="muted">Загружаю свежий расход, прогноз и рельеф.</div></div>`;
 
   const near = nearestRiver(lat, lon);
-  const terrainP = fetchTerrain(lat, lon).catch(() => null);
+  let terrainError = null;
+  const terrainP = fetchTerrain(lat, lon).catch(e => { terrainError = e.message; return null; });
   let airError = null;
   const airP = fetchAir(lat, lon).catch(e => { airError = e.message; return null; });
   let live = null, liveError = null;
@@ -346,7 +347,7 @@ async function analyze(lat, lon) {
   else html += `<div class="card"><h3>Вода · паводки</h3><div class="muted">В MVP есть реки: ${RIVERS.map(r => r.name).join(", ")}.
     Эта точка дальше ${MAX_SNAP_KM} км от них.</div></div>`;
   html += airCard(air, airError);
-  html += terrain ? terrainCard(terrain) : `<div class="card"><h3>Рельеф</h3><div class="muted">Не удалось загрузить рельеф.</div></div>`;
+  html += terrain ? terrainCard(terrain) : `<div class="card"><h3>Рельеф</h3><div class="muted">Не удалось загрузить рельеф: ${terrainError || "нет ответа"}</div></div>`;
   html += DISCLAIMER + `<div class="muted">Пороги рассчитаны: ${DATA.generated || "—"}</div>`;
   panel.innerHTML = html;
 
