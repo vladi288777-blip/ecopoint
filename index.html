@@ -531,81 +531,6 @@ function checkCard(river) {
   </div>`;
 }
 
-
-// ---------- Водный резерв: что если часть паводка задержать ----------
-// Идеализированная модель управляемого хранилища (суточный шаг):
-// пока расход выше целевого — излишек уходит в хранилище; когда ниже — хранилище
-// понемногу отдаёт воду, не поднимая реку выше цели. V нужный = максимум заполнения.
-// НЕ учитывает время добегания, геометрию поймы, потери и сооружения.
-const DT = 86400, DEPTH_M = 0.5;
-function simulateReserve(series, target) {
-  let S = 0, Smax = 0, days = 0;
-  const out = series.map(p => {
-    let q = p.q;
-    if (q > target) { S += (q - target) * DT; days++; q = target; }
-    else if (S > 0) { const r = Math.min(S / DT, target - q); S -= r * DT; q += r; }
-    Smax = Math.max(Smax, S);
-    return { t: p.t, q };
-  });
-  return { out, mln: Smax / 1e6, km2: Smax / DEPTH_M / 1e6, days };
-}
-function drawTwo(canvas, before, after, target) {
-  const dpr = window.devicePixelRatio || 1, W = canvas.clientWidth, H = canvas.clientHeight;
-  canvas.width = W * dpr; canvas.height = H * dpr;
-  const c = canvas.getContext("2d"); c.scale(dpr, dpr);
-  const maxQ = Math.max(...before.map(p => p.q)) * 1.1 || 1, pad = { l: 46, r: 8, t: 10, b: 18 };
-  const x = i => pad.l + (i / Math.max(before.length - 1, 1)) * (W - pad.l - pad.r);
-  const y = q => H - pad.b - (q / maxQ) * (H - pad.t - pad.b);
-  c.font = "11px system-ui"; c.fillStyle = "#8a9aa3";
-  [0, 0.5, 1].forEach(f => c.fillText(fmt(maxQ / 1.1 * f), 2, y(maxQ / 1.1 * f) + 4));
-  c.fillText(dm(before[0].t + "T"), pad.l, H - 4);
-  c.fillText(dm(before[before.length - 1].t + "T"), W - pad.r - 30, H - 4);
-  // зона, которую забрало хранилище
-  c.fillStyle = "rgba(88,166,255,.25)"; c.beginPath();
-  before.forEach((p, i) => i ? c.lineTo(x(i), y(p.q)) : c.moveTo(x(i), y(p.q)));
-  for (let i = after.length - 1; i >= 0; i--) c.lineTo(x(i), y(after[i].q));
-  c.fill();
-  c.setLineDash([4, 4]); c.strokeStyle = "#f0883e"; c.beginPath(); c.moveTo(pad.l, y(target)); c.lineTo(W - pad.r, y(target)); c.stroke(); c.setLineDash([]);
-  [[before, "#8a9aa3"], [after, "#58a6ff"]].forEach(([ser, col]) => {
-    c.strokeStyle = col; c.lineWidth = 2; c.beginPath();
-    ser.forEach((p, i) => i ? c.lineTo(x(i), y(p.q)) : c.moveTo(x(i), y(p.q))); c.stroke();
-  });
-}
-function reserveCard(river) {
-  if (!river.spring2024 || !river.peak2024 || !river.thresholds) return "";
-  const peak = river.peak2024.q, th = river.thresholds;
-  const rows = [
-    [`ниже «Высокой опасности» (${fmt(th.q10)} м³/с)`, th.q10],
-    [`ниже «Опасности» (${fmt(th.q5)} м³/с)`, th.q5],
-    ["пик −10%", peak * 0.9], ["пик −20%", peak * 0.8], ["пик −30%", peak * 0.7],
-  ].filter(([, q]) => q < peak).map(([n, q]) => {
-    const r = simulateReserve(river.spring2024, q);
-    return `<tr><td>${n}</td><td>${fmt(r.mln)}</td><td>${fmt(r.km2)}</td><td>${r.days}</td></tr>`;
-  }).join("");
-  return `<div class="card"><h3>Водный резерв: если задержать часть паводка</h3>
-    <div class="muted">Весна 2024. Сколько воды нужно временно задержать выше по реке, чтобы расход не поднялся выше цели, и сколько это полей под ${DEPTH_M} м воды.</div>
-    <canvas id="chartReserve"></canvas>
-    <div class="row"><span>Цель: не выше</span><b><input id="resT" type="range" min="50" max="99" value="80" style="vertical-align:middle"> <span id="resTv"></span></b></div>
-    <div id="resOut"></div>
-    <table style="width:100%;font-size:12px;margin-top:8px;border-collapse:collapse">
-      <tr class="muted"><td>Цель</td><td>млн м³</td><td>км² при ${DEPTH_M} м</td><td>дней</td></tr>${rows}</table>
-    <div class="muted" style="margin-top:6px">Идеальная модель: мгновенное управляемое хранилище без потерь. Не учитывает время добегания, рельеф поймы и сооружения; расход ≠ уровень у гидропоста. Это оценка масштаба, а не проект защиты.</div>
-  </div>`;
-}
-function bindReserve(river) {
-  const sl = document.getElementById("resT"); if (!sl) return;
-  const upd = () => {
-    const target = river.peak2024.q * sl.value / 100, r = simulateReserve(river.spring2024, target);
-    document.getElementById("resTv").textContent = `${sl.value}% пика · ${fmt(target)} м³/с`;
-    document.getElementById("resOut").innerHTML =
-      `<div class="row"><span>Нужно задержать</span><b>${fmt(r.mln)} млн м³</b></div>
-       <div class="row"><span>Площадь при глубине ${DEPTH_M} м</span><b>${fmt(r.km2)} км² (${fmt(r.km2 * 100)} га)</b></div>
-       <div class="row"><span>Дней набора воды</span><b>${r.days}</b></div>`;
-    drawTwo(document.getElementById("chartReserve"), river.spring2024, r.out, target);
-  };
-  sl.oninput = upd; upd();
-}
-
 function terrainCard(t) {
   return `<div class="card"><h3>Рельеф вокруг</h3>
     <div class="row"><span>Высота места</span><b>${fmt(t.h0)} м</b></div>
@@ -644,7 +569,7 @@ async function analyze(lat, lon) {
   if (near) html += `<div class="row"><span>Ячейка реки в модели</span><b>~${fmt(near.dist, 1)} км</b></div>`;
   html += `</div>`;
   if (near) html += waterCard(near.river, live, liveError)
-    + smsCard(lat, lon, near.river, live, terrain) + actionsCard() + checkCard(near.river) + reserveCard(near.river);
+    + smsCard(lat, lon, near.river, live, terrain) + actionsCard() + checkCard(near.river);
   else html += `<div class="card"><h3>Вода · паводки</h3><div class="muted">В MVP есть реки: ${RIVERS.map(r => r.name).join(", ")}.
     Эта точка дальше ${MAX_SNAP_KM} км от них.</div></div>`;
   html += airCard(air, airError);
@@ -663,7 +588,6 @@ async function analyze(lat, lon) {
   if (cSun && sol) drawChart(cSun, sol.hours, null, sol.hours.length, null, "кВт·ч");
   const c24 = document.getElementById("chart2024");
   if (c24) drawChart(c24, near.river.spring2024, near.river.thresholds, near.river.spring2024.length, near.river.known_peak?.date);
-  if (near) bindReserve(near.river);
 
   drawWasteMarkers();
   if (riverMarker) map.removeLayer(riverMarker);
